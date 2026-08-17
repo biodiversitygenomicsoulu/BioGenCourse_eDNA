@@ -1,0 +1,1702 @@
+---
+title: "eDNA Course - Diversity analysis"
+author: "Patrick Nichols"
+date: "2026-07-02"
+output: html_document
+---
+
+## 1. Setup
+
+Session -> Set working directory -> To source file location...
+
+Carefully update the user-defined settings for each run, making sure column names and index positions match.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(iNEXT)
+library(vegan)
+library(ggpubr)
+library(indicspecies)
+library(microDecon)
+library(purrr)
+library(tibble)
+library(readxl)
+set.seed(13)
+numperm=9999 #Permutation tests
+
+paths=list(
+  data_raw      ="data/raw",
+  data_processed="data/processed",
+  results_rds   ="results/rds",
+  results_tables="results/tables",
+  results_figs  ="results/figures"
+)
+
+walk(paths, dir.create, showWarnings = FALSE, recursive = TRUE)
+
+cols.method=c("#031d44", "#1a659e", "#d5896f", "#dab785", "#70a288", "snow3", "black")
+
+#### RUN SETTINGS #######################################################
+num.blanks=14 # how many columns of blanks/negative control samples?
+SAMPLE="Sample_ID" # name of metadata column with sample IDs
+OTU_ID="OTU_ID" # name of OTU ID column in OTU table
+GROUPING="TREATMENT" # name of grouping variable column in metadata
+TAXONOMICRANK= "Genus" # choose taxonomic rank for indicator taxon analysis
+distance.method="bray" #choose distance method for community dissimilarity ordination
+#########################################################################
+
+#### READ IN OTU TABLE ##################################################
+otutab.raw=read_excel(file.choose())  # raw OTU table, with Unique ID/OTU_ID as first column, apscale taxonomic information
+otutab.predecon=otutab.raw[,c(1:129)] # select only OTU ID and numerical read count columns
+otutab.predecon[, -1] <- lapply(otutab.predecon[, -1], function(x) {
+  if(is.character(x)) as.numeric(trimws(x)) else x
+})
+# Remove zero-sum rows (keep ID column)
+otutab.predecon <- otutab.predecon[rowSums(otutab.predecon[, -1]) != 0, ]
+# Remove zero-sum columns (keep ID column)
+otutab.predecon <- otutab.predecon[, c(1, which(colSums(otutab.predecon[, -1]) != 0) + 1)]
+apscale.info=otutab.raw[,c(1,130:ncol(otutab.raw))] # select taxonomic info and other columns from apscale
+#########################################################################
+
+#### READ IN METADATA FILE #############################################
+metadata=read_excel(file.choose())
+metadata=subset(metadata, Run != "1")
+metadata=subset(metadata, SITE=="Station2" | SITE=="Station3")
+metadata=subset(metadata, SITE != "Control")
+metadata=subset(metadata, Sample_ID != "Teleo2_run4_barcode68") # failed samples?
+metadata=subset(metadata, Sample_ID != "Teleo2_run4_barcode65") # failed samples?
+metadata$QUBIT <- as.numeric(gsub(",", ".", trimws(metadata$QUBIT)))
+#######################################################################
+```
+
+### Decontamination
+
+#### MicroDecon
+
+```{r}
+otutab.predecon <- as.data.frame(otutab.predecon)
+
+# Run decontamination
+microdecon.decontaminated <- decon(otutab.predecon,numb.blanks = num.blanks, numb.ind = (ncol(otutab.predecon)-num.blanks-1),taxa = FALSE,thresh = 1,prop.thresh = 0, runs = 1)
+
+reads.removed=microdecon.decontaminated$reads.removed
+decontaminated.table <- microdecon.decontaminated$decon.table
+decontaminated.table$Mean.blank <- NULL
+
+reads.removed=microdecon.decontaminated$reads.removed
+reads.removed=merge(reads.removed, apscale.info, by=OTU_ID)
+
+decontaminated.table.metadata=merge(decontaminated.table, apscale.info, by=OTU_ID) # merge taxonomic info back into decontaminated file
+
+write.csv(decontaminated.table.metadata, file=file.path(paths$data_processed, "decontaminated_data_teleo.csv"), row.names = F) ## save to PC
+```
+
+
+### Data cleaning and prepping
+
+This block removes human-related taxa (genus Homo) from the dataset and renames the rows using organism IDs. It then isolates the taxonomic classification columns into a separate table called 'taxa'.
+
+```{r}
+otutab=decontaminated.table.metadata
+
+# Filter unwanted taxa
+data=subset(otutab, Order !="Primates") # if taxonomy information is present in OTU table
+data=subset(data, Kingdom !="NoMatch") # if taxonomy information is present in OTU table
+data=subset(data, Genus !="Cranioleuca") # if taxonomy information is present in OTU table
+
+
+row.names(data)=data[[OTU_ID]]
+final=data[,2:115] # Update me
+rownames(final)=data[["OTU_ID"]]
+
+final.t=as.data.frame(t(final))
+final.t[[SAMPLE]]=rownames(final.t)
+final.t.meta=merge(final.t, metadata, by=SAMPLE)
+
+final.t=final.t.meta[,2:(nrow(data)+1)]
+rownames(final.t)=final.t.meta[[SAMPLE]]
+
+final=as.data.frame(t(final.t))
+final <- final[, colSums(final) != 0] # remove zero sum columns
+final <- final[rowSums(final) != 0, ] # remove zero sum rows
+#final <- final[, colSums(final != 0) > 1] # remove samples with only 1 OTU
+ntax=nrow(final)
+nsample=ncol(final)
+final[[OTU_ID]]=rownames(final)
+
+final=merge(final, apscale.info, by=OTU_ID)
+rownames(final)=final[[OTU_ID]]
+
+# Taxonomic metadata only
+taxa=final[, (nsample+2):ncol(final)]
+rownames(taxa)=final[[OTU_ID]]
+taxa[[OTU_ID]]=rownames(taxa)
+```
+
+
+### Transformations
+
+This code prepares three versions of your OTU table (raw counts, Hellinger-transformed, and eDNA index), then lets you choose one for downstream analysis. The final steps transpose the table so taxa become columns and samples become rows, then merges it with site metadata for statistical testing.
+
+#### Raw Reads (no transformation)
+
+```{r}
+# Raw reads OTU table only, no metadata
+table.raw=final[, 2:(nsample+1)]
+final_reads=final # make a copy for raw reads (will not undergo transformations)
+table.reads=final_reads[,2:(nsample+1)]
+
+sum(table.reads)
+
+table.reads.t <- as.data.frame(t(table.reads))  # Flip OTU table so taxa as columns
+
+table.reads.t[[SAMPLE]] <- row.names(table.reads.t) # add sample column to merge with metadata
+metatable.reps.reads=merge(table.reads.t, metadata, by=SAMPLE) ##OTU table with site metadata correctly formatted for downstream analyses
+
+table.reads.t[[SAMPLE]]=NULL #remove non-numeric columns for downstream analyses
+```
+
+#### Presence-Absence (Binary) 
+
+```{r}
+table_pa=decostand(table.reads, method = "pa")
+table_pa[[OTU_ID]]=rownames(table_pa)
+final_pa=merge(table_pa, taxa, by=OTU_ID)
+rownames(final_pa)=final_pa[[OTU_ID]]
+table_pa[[OTU_ID]]=NULL
+table_pa.t=t(table_pa)
+```
+
+#### Hellinger 
+
+```{r}
+table_hel=decostand(table.reads, method = "hellinger")
+table_hel[[OTU_ID]]=rownames(table_hel)
+final_hel=merge(table_hel, taxa, by=OTU_ID)
+rownames(final_hel)=final_hel[[OTU_ID]]
+table_hel[[OTU_ID]]=NULL
+table_hel.t=t(table_hel)
+```
+
+#### eDNA Index
+
+```{r}
+table.raw <- as.matrix(table.reads)  # Compute relative abundance per sample (column-wise)
+relative_abundance <- sweep(table.raw, 2, colSums(table.raw), "/")  # Find the maximum observed abundance for each OTU across all samples (row-wise)
+max_relative_abundance <- apply(relative_abundance, 1, max, na.rm = TRUE)  # Compute the eDNA index by dividing each OTU's abundance by its max
+table_index <- as.data.frame(sweep(relative_abundance, 1, max_relative_abundance, "/"))  # Add OTU IDs back to the table
+
+table_index[[OTU_ID]] <- rownames(table_index) # Merge with taxa metadata (assuming 'taxa' has OTU_ID as key)
+final_index <- merge(table_index, taxa, by = OTU_ID) # Ensure row names match OTU_ID
+rownames(final_index) <- final_index[[OTU_ID]] 
+table_index[[OTU_ID]] <- NULL
+table_index.t=t(table_index)
+```
+
+#### Prepare community data
+
+```{r}
+####CHOOSE MATRIX###################################################
+community.table.t=table_index.t #transposed otu table version (OPTIONS: table_index.t, table_hel.t, table.reads.t. table_pa.t)
+community.table=table_index #otu table only (OPTIONS: table_index, table_hel, table.reads, table_pa, etc.)
+community.data=final_index #version with metadata (OPTIONS: final_index, final_hel, final_reads, final_pa, etc.)
+###################################################################
+#community.table.t=table.reads.t #transposed otu table version (OPTIONS: table_index.t, table_hel.t, table.reads.t. table_pa.t)
+#community.table=table.reads #otu table only (OPTIONS: table_index, table_hel, table.reads, table_pa, etc.)
+#community.data=final_reads #version with metadata (OPTIONS: final_index, final_hel, final_reads, final_pa, etc.)
+```
+
+#### Merge filtered metadata
+
+```{r}
+table.t <- as.data.frame(t(as.matrix(community.table)))
+
+ntax=ncol(table.t)
+nsample=nrow(table.t)
+
+table.t[[SAMPLE]]=row.names(table.t) ##OTU table only
+
+# Remove leading zeros from SAMPLE column
+metatable.reps=merge(table.t, metadata, by=SAMPLE) ##OTU table with site metadata
+table.t[[SAMPLE]]=NULL
+```
+
+
+
+####Melt data long format
+
+```{r}
+data_long <- as.data.frame(community.table.t) %>%
+  rownames_to_column(var = SAMPLE) %>%
+  pivot_longer(
+    cols = -SAMPLE,  # Keep SampleID as identifier
+    names_to = OTU_ID,
+    values_to = "abundance"
+  )
+
+# Remove zero abundances (optional)
+data_long <- data_long %>%
+  filter(abundance > 0)
+
+data_long=merge(data_long, metadata, by=SAMPLE)
+data_long=merge(data_long, apscale.info, by=OTU_ID)
+```
+
+## 2. Treatment Summaries
+
+### Total DNA Concentration
+
+```{r}
+# Create a distinct sample-level dataset for QUBIT values
+qubit_by_sample <- data_long %>%
+  distinct(!!sym(SAMPLE), .keep_all = TRUE) 
+
+# OR, if you want to be more explicit:
+qubit_by_sample <- data_long %>%
+  dplyr::select(SAMPLE, Run, TREATMENT, FILTRATION, EXTRACTION, QUBIT, SITE) %>%
+  distinct()
+
+qubit_by_sample %>% 
+  group_by(Run) %>% 
+  summarise(total_qubit = sum(as.numeric(trimws(QUBIT)), na.rm = TRUE))
+
+# By Treatment - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(TREATMENT) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By Filtration - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(FILTRATION) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By Extraction - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(EXTRACTION) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By all four factors - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(TREATMENT, FILTRATION, EXTRACTION, Run) %>% 
+  summarise(
+    total_qubit = sum(QUBIT, na.rm = TRUE),
+    mean_qubit = mean(QUBIT, na.rm = TRUE),
+    n = n()
+  ) %>% 
+  arrange(desc(total_qubit))
+
+# Sum QUBIT across treatments and runs (corrected)
+qubit_by_sample %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE)) %>%
+  pivot_wider(names_from = Run, values_from = total_qubit, values_fill = 0)
+
+# Overall summary by Treatment - QUBIT (corrected)
+qubit_by_sample %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    total = sum(QUBIT, na.rm = TRUE),
+    mean = mean(QUBIT, na.rm = TRUE),
+    median = median(QUBIT, na.rm = TRUE),
+    min = min(QUBIT, na.rm = TRUE),
+    max = max(QUBIT, na.rm = TRUE),
+    sd = sd(QUBIT, na.rm = TRUE),
+    n = n()
+  )
+
+# 1. By TREATMENT - Boxplot with jitter (QUBIT) - CORRECTED
+ggplot(qubit_by_sample, aes(x = TREATMENT, y = QUBIT, fill = TREATMENT)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  labs(
+    title = "QUBIT Distribution by Treatment",
+    x = "Treatment",
+    y = "QUBIT (ng/uL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + 
+  scale_color_manual(values = cols.method) + 
+  scale_fill_manual(values = cols.method)
+
+# 2. By Run - Boxplot (QUBIT) - CORRECTED
+ggplot(qubit_by_sample, aes(x = Run, y = QUBIT, fill = Run)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  labs(
+    title = "QUBIT Distribution by Run",
+    x = "Run",
+    y = "QUBIT (ng/uL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 5. Treatment × Run interaction plot (QUBIT) - CORRECTED
+treatment_run_summary <- qubit_by_sample %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(
+    mean_qubit = mean(QUBIT, na.rm = TRUE),
+    sd_qubit = sd(QUBIT, na.rm = TRUE),
+    n = n()
+  ) %>%
+  mutate(se_qubit = sd_qubit / sqrt(n)) 
+
+ggplot(treatment_run_summary, aes(x = Run, y = mean_qubit, color = TREATMENT, group = TREATMENT)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_qubit - se_qubit, ymax = mean_qubit + se_qubit),
+                width = 0.2, alpha = 0.5) +
+  labs(
+    title = "Treatment × Run Interaction (QUBIT)",
+    x = "Run",
+    y = "Mean QUBIT (ng/uL)",
+    color = "Treatment"
+  ) +
+  theme_minimal() + 
+  scale_color_manual(values = cols.method) + 
+  scale_fill_manual(values = cols.method)
+
+# 7. Faceted by Treatment: QUBIT by Run - CORRECTED
+ggplot(qubit_by_sample, aes(x = Run, y = QUBIT, fill = Run)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~TREATMENT, scales = "free_y") +
+  labs(
+    title = "QUBIT by Run within Each Treatment",
+    x = "Run",
+    y = "QUBIT (ng/uL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 8. Faceted by Run: QUBIT by Treatment - CORRECTED
+ggplot(qubit_by_sample, aes(x = TREATMENT, y = QUBIT, fill = TREATMENT)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~Run) +
+  labs(
+    title = "QUBIT by Treatment within Each Run",
+    x = "Treatment",
+    y = "QUBIT (ng/uL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_manual(values = cols.method) + 
+  scale_fill_manual(values = cols.method) + scale_y_sqrt()
+
+# 10. Summary bar plot with error bars (QUBIT) - CORRECTED
+treatment_summary <- qubit_by_sample %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    mean_qubit = mean(QUBIT, na.rm = TRUE),
+    se_qubit = sd(QUBIT, na.rm = TRUE) / sqrt(n()),
+    n = n()
+  )
+
+
+meanqubitplot <- ggplot(treatment_summary, aes(x = TREATMENT, y = mean_qubit, fill = TREATMENT)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_qubit - se_qubit, ymax = mean_qubit + se_qubit),
+                width = 0.2) +
+  labs(x = "", y = "Total DNA Concentraton (ng/uL)") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_blank()) + 
+  scale_color_manual(values = cols.method) + 
+  scale_fill_manual(values = cols.method) + scale_y_sqrt()
+
+meanqubitplot
+```
+
+
+### Read abundance
+
+```{r}
+# By Run
+aggregate(abundance ~ Run, data = data_long, FUN = sum)
+# or with dplyr
+library(dplyr)
+data_long %>% group_by(Run) %>% summarise(total_abund = sum(abundance))
+
+# By Treatment
+data_long %>% group_by(TREATMENT) %>% summarise(total_abund = sum(abundance))
+
+# By Filtration
+data_long %>% group_by(FILTRATION) %>% summarise(total_abund = sum(abundance))
+
+# By Extraction
+data_long %>% group_by(EXTRACTION) %>% summarise(total_abund = sum(abundance))
+
+# By all four factors
+data_long %>% 
+  group_by(TREATMENT, FILTRATION, EXTRACTION, Run) %>% 
+  summarise(
+    total_abund = sum(abundance),
+    mean_abund = mean(abundance),
+    n = n()
+  ) %>% 
+  arrange(desc(total_abund))
+
+# Sum abundance across treatments and runs
+library(tidyr)
+data_long %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(total_abund = sum(abundance)) %>%
+  pivot_wider(names_from = Run, values_from = total_abund, values_fill = 0)
+
+# Overall summary by Treatment
+data_long %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    total = sum(abundance),
+    mean = mean(abundance),
+    median = median(abundance),
+    min = min(abundance),
+    max = max(abundance),
+    sd = sd(abundance),
+    n = n()
+  )
+
+data_long <- data_long %>%
+  mutate(Run = as.factor(Run))
+
+# 1. By TREATMENT - Boxplot with jitter
+ggplot(data_long, aes(x = TREATMENT, y = abundance, fill = TREATMENT)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  scale_y_log10() +  # Log scale if data spans many orders of magnitude
+  labs(
+    title = "Abundance Distribution by Treatment",
+    x = "Treatment",
+    y = "Abundance (log scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+# 2. By Run - Boxplot
+ggplot(data_long, aes(x = Run, y = abundance, fill = Run)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Abundance Distribution by Run",
+    x = "Run",
+    y = "Abundance (log scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# 5. Treatment × Run interaction plot
+treatment_run_summary <- data_long %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(
+    mean_abund = mean(abundance, na.rm = TRUE),
+    sd_abund = sd(abundance, na.rm = TRUE),
+    n = n()
+  ) %>%
+  mutate(se_abund = sd_abund / sqrt(n)) 
+
+ggplot(treatment_run_summary, aes(x = Run, y = mean_abund, color = TREATMENT, group = TREATMENT)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_abund - se_abund, ymax = mean_abund + se_abund),
+                width = 0.2, alpha = 0.5) +
+  labs(
+    title = "Treatment × Run Interaction",
+    x = "Run",
+    y = "Mean Abundance",
+    color = "Treatment"
+  ) +
+  theme_minimal()+ scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+
+# 7. Faceted by Treatment: Abundance by Run
+ggplot(data_long, aes(x = Run, y = abundance, fill = Run)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~TREATMENT, scales = "free_y") +
+  scale_y_log10() +
+  labs(
+    title = "Abundance by Run within Each Treatment",
+    x = "Run",
+    y = "Abundance (log scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 8. Faceted by Run: Abundance by Treatment
+ggplot(data_long, aes(x = TREATMENT, y = abundance, fill = TREATMENT)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~Run, scales = "free_y") +
+  scale_y_log10() +
+  labs(
+    title = "Abundance by Treatment within Each Run",
+    x = "Treatment",
+    y = "Abundance (log scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))+ scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+# 10. Summary bar plot with error bars
+treatment_summary <- data_long %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    mean_abund = mean(abundance, na.rm = TRUE),
+    se_abund = sd(abundance, na.rm = TRUE) / sqrt(n()),
+    n = n()
+  )
+
+meanreadabund=ggplot(treatment_summary, aes(x = TREATMENT, y = mean_abund, fill = TREATMENT)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_abund - se_abund, ymax = mean_abund + se_abund),
+                width = 0.2) +
+  labs(
+    x = "Treatment",
+    y = "Read Abundance"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+ scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method) +scale_y_sqrt()
+meanreadabund
+
+dnaabundplot=ggarrange(meanqubitplot, meanreadabund, nrow = 2, labels = "AUTO")
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("DNA_abundance_", GROUPING,"_teleo2.pdf")),
+  plot    =dnaabundplot,
+  width   =8,
+  height  =6,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+### Contamination
+
+#### Load
+
+```{r}
+rownames(reads.removed)=reads.removed$ID
+reads.removed$Mean.blank=NULL
+reads.removed$ID=NULL
+reads.removed.t=as.data.frame(t(reads.removed))
+reads.removed.t[[SAMPLE]]=rownames(reads.removed.t)
+
+contaminatedreads=merge(reads.removed.t, metadata, by=SAMPLE)
+
+
+otu.cols <- !(names(contaminatedreads) %in%
+    c(SAMPLE,"Index","Run","Marker","PrimerF","PrimerR",
+      "FIELD_ID","FILTRATION","EXTRACTION","TREATMENT",
+      "Unique_SAMPLE_ID","LAT","LON","SITE"))
+
+removed <- contaminatedreads
+
+removed[otu.cols] <- lapply(removed[otu.cols], function(x)
+    as.numeric(replace(x, is.na(x), 0)))
+
+removed$contam_reads <- rowSums(removed[, otu.cols])
+
+contamreads=ggplot(removed, aes(x = TREATMENT, y = contam_reads, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  scale_y_log10() +
+  #scale_y_sqrt() +
+  labs(y = "Contaminant Reads", x="") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_blank()) + scale_fill_manual(values = cols.method)
+contamreads
+
+library(glmmTMB)
+contamload.mod=glmmTMB(contam_reads ~ TREATMENT + (1|SITE),
+        family=nbinom2,
+        data=removed)
+contamload.mod
+summary(contamload.mod)
+```
+
+#### Frequency
+
+```{r}
+removed$contam_otus <-
+    rowSums(removed[, otu.cols] > 0, na.rm = TRUE)
+
+contamfreq.mod=glmmTMB(contam_otus ~ TREATMENT,
+        family = nbinom2,
+        data = removed)
+
+summary(contamfreq.mod)
+
+library(emmeans)
+emmeans(contamfreq.mod, pairwise ~ TREATMENT, type = "response")
+
+# Visualize contaminant OTUs by treatment
+contamotus=ggplot(removed, aes(x = TREATMENT, y = contam_otus, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  scale_y_log10() +
+  labs(y = "Contaminant OTUs") +
+  theme_minimal() +
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) + 
+  scale_fill_manual(values = cols.method) + scale_y_sqrt()
+contamotus
+
+# Model contaminant OTUs with GLMM (including SITE as random effect)
+contamfreq.mod <- glmmTMB(
+  contam_otus ~ TREATMENT + (1|SITE),
+  family = nbinom2,
+  data = removed
+)
+
+# Model summary
+summary(contamfreq.mod)
+
+# Check model diagnostics
+# Residuals
+simulationOutput <- DHARMa::simulateResiduals(contamfreq.mod)
+plot(simulationOutput)
+
+# Get treatment means and pairwise comparisons
+library(emmeans)
+
+# Estimated marginal means
+emmeans(contamfreq.mod, ~ TREATMENT, type = "response")
+
+# Pairwise comparisons
+pairwise_comparisons <- emmeans(contamfreq.mod, pairwise ~ TREATMENT, type = "response")
+print(pairwise_comparisons)
+
+# Extract just the pairwise comparisons table
+pairwise_comparisons$contrasts
+
+# If you want compact letter display
+library(multcomp)
+cld_contamfreq <- cld(emmeans(contamfreq.mod, ~ TREATMENT, type = "response"),
+                      Letters = letters,
+                      adjust = "tukey")
+print(cld_contamfreq)
+
+# Create a summary table of contaminant OTUs by treatment
+contam_otus_summary <- removed %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n_samples = n(),
+    mean_otus = mean(contam_otus, na.rm = TRUE),
+    median_otus = median(contam_otus, na.rm = TRUE),
+    sd_otus = sd(contam_otus, na.rm = TRUE),
+    se_otus = sd_otus / sqrt(n()),
+    min_otus = min(contam_otus, na.rm = TRUE),
+    max_otus = max(contam_otus, na.rm = TRUE)
+  )
+
+# Export results
+# Save pairwise comparisons
+pairwise_df <- as.data.frame(pairwise_comparisons$contrasts)
+
+
+contamplot=ggarrange(contamreads, contamotus, nrow = 2, labels = "AUTO")
+contamplot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("Contaminated_", GROUPING,"_teleo2.pdf")),
+  plot    =contamplot,
+  width   =8,
+  height  =8,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+#### Proportion (Not working NA treatments)
+
+```{r}
+#### Proportion of Reads Removed from Original (Pre-Decontamination) Reads
+
+# Extract the data frames
+reads_removed <- microdecon.decontaminated$reads.removed
+otutab_predecon <- otutab.predecon  # Your original raw OTU table
+
+library(tidyverse)
+
+# DATA STRUCTURES:
+# reads_removed: 
+#   - Rows = OTUs (contaminants, identified by ID)
+#   - Columns = Samples (named with run_barcode names) + ID + Mean.blank
+#   - Values = number of reads of that contaminant OTU removed from that sample
+
+# otutab_predecon:
+#   - Rows = ALL OTUs (identified by ID)  
+#   - Columns = Samples (named with run_barcode names) + ID
+#   - Values = number of raw reads for that OTU in that sample
+
+# Get sample names from pre-decontamination table (exclude ID column)
+sample_names <- colnames(otutab_predecon)[!(colnames(otutab_predecon) %in% c("ID"))]
+
+# Verify that reads_removed has the same sample columns
+sample_names_removed <- colnames(reads_removed)[!(colnames(reads_removed) %in% c("ID", "Mean.blank"))]
+
+cat("Number of samples in pre-decon table:", length(sample_names), "\n")
+cat("Number of samples in reads_removed:", length(sample_names_removed), "\n")
+
+# Use intersection to be safe
+common_samples <- intersect(sample_names, sample_names_removed)
+cat("Number of common samples:", length(common_samples), "\n")
+
+# CORRECT METHOD: Calculate total reads removed per sample from reads_removed
+total_reads_removed <- colSums(reads_removed[, common_samples, drop = FALSE], na.rm = TRUE)
+
+# Calculate total original reads per sample from pre-decontamination table
+total_reads_original <- colSums(otutab_predecon[, common_samples, drop = FALSE], na.rm = TRUE)
+
+# Calculate number of contaminant OTUs per sample (OTUs with >0 reads removed)
+n_contaminant_otus <- colSums(reads_removed[, common_samples, drop = FALSE] > 0, na.rm = TRUE)
+
+# Calculate total OTUs in original sample
+n_total_otus <- colSums(otutab_predecon[, common_samples, drop = FALSE] > 0, na.rm = TRUE)
+
+# Create summary data frame
+sample_stats <- data.frame(
+  SAMPLE = common_samples,
+  total_reads_original = total_reads_original[common_samples],
+  total_reads_removed = total_reads_removed[common_samples],
+  n_total_otus = n_total_otus[common_samples],
+  n_contaminant_otus = n_contaminant_otus[common_samples],
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    # Calculate proportion removed from original reads
+    proportion_removed = ifelse(total_reads_original == 0, 0, total_reads_removed / total_reads_original),
+    percent_removed = proportion_removed * 100,
+    
+    # Optional: Calculate remaining reads (for verification)
+    total_reads_remaining = total_reads_original - total_reads_removed,
+    
+    # Proportion of OTUs that were contaminants
+    proportion_contaminant_otus = ifelse(n_total_otus == 0, 0, n_contaminant_otus / n_total_otus),
+    percent_contaminant_otus = proportion_contaminant_otus * 100
+  ) %>%
+  arrange(desc(percent_removed))
+
+# View results
+print(head(sample_stats))
+
+# Summary statistics
+cat("\nSummary of percent removed from original reads:\n")
+print(summary(sample_stats$percent_removed))
+
+cat("\nSummary of percent contaminant OTUs:\n")
+print(summary(sample_stats$percent_contaminant_otus))
+
+# Check if any samples have zero original reads
+zero_samples <- sample_stats %>% filter(total_reads_original == 0)
+if(nrow(zero_samples) > 0) {
+  cat("\nSamples with zero total reads:", nrow(zero_samples), "\n")
+  print(zero_samples$SAMPLE)
+}
+
+# Verify that removed reads don't exceed original reads
+sample_stats <- sample_stats %>%
+  mutate(
+    check_removed_exceeds_original = total_reads_removed > total_reads_original
+  )
+
+if(any(sample_stats$check_removed_exceeds_original)) {
+  cat("\nWarning: Some samples have more removed reads than original reads!\n")
+  print(sample_stats %>% filter(check_removed_exceeds_original) %>% 
+          dplyr::select(SAMPLE, total_reads_original, total_reads_removed))
+}
+
+# Add Mean.blank from reads_removed
+sample_stats$Mean.blank <- unique(reads_removed$Mean.blank)[1]
+
+# Join metadata
+sample_stats_with_treatment <- sample_stats %>%
+  left_join(metadata, by = c("SAMPLE" = "SAMPLE_ID"))
+
+# Check for missing metadata
+missing_treatment <- sample_stats_with_treatment %>%
+  filter(is.na(TREATMENT))
+
+if(nrow(missing_treatment) > 0) {
+  cat("\nWarning:", nrow(missing_treatment), "samples have no treatment information:\n")
+  print(missing_treatment$SAMPLE)
+} else {
+  cat("\nAll samples matched with treatment information!\n")
+}
+
+# Visualizations
+# Make sure cols.method is defined
+if(!exists("cols.method")) {
+  # Define some default colors
+  treatments <- unique(sample_stats_with_treatment$TREATMENT)
+  if(requireNamespace("RColorBrewer", quietly = TRUE)) {
+    cols.method <- setNames(RColorBrewer::brewer.pal(min(8, length(treatments)), "Set2"), treatments)
+  } else {
+    cols.method <- setNames(rainbow(length(treatments)), treatments)
+  }
+}
+
+# 1. Violin + Boxplot of percent removed by treatment
+ggplot(sample_stats_with_treatment, aes(x = TREATMENT, y = percent_removed, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  labs(
+    title = "Percent of Original Reads Removed as Contaminants by Treatment",
+    y = "Percent Reads Removed (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) + 
+  scale_fill_manual(values = cols.method) + scale_y_sqrt()
+
+# 3. Scatter plot: Original reads vs Removed reads
+ggplot(sample_stats_with_treatment, aes(x = total_reads_original, 
+                                         y = total_reads_removed,
+                                         color = TREATMENT)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Original Reads vs Removed Reads by Treatment",
+    x = "Total Original Reads (log scale)",
+    y = "Total Reads Removed (log scale)",
+    color = "Treatment"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = cols.method)
+
+# Statistical Modeling (Beta regression)
+library(glmmTMB)
+library(emmeans)
+library(DHARMa)
+
+# Convert percent to proportion (0-1 scale) and adjust for beta regression
+sample_stats_with_treatment <- sample_stats_with_treatment %>%
+  mutate(proportion_removed = percent_removed / 100)
+
+# Adjust proportions to avoid 0 and 1 for beta regression
+n <- nrow(sample_stats_with_treatment)
+sample_stats_with_treatment <- sample_stats_with_treatment %>%
+  mutate(
+    proportion_removed_adj = (proportion_removed * (n - 1) + 0.5) / n,
+    # Check if any are still 0 or 1
+    check_zero = proportion_removed_adj == 0,
+    check_one = proportion_removed_adj == 1
+  )
+
+# Beta regression with random effect for site
+prop_removed.mod <- glmmTMB(
+  proportion_removed_adj ~ TREATMENT + (1|SITE),
+  family = beta_family(link = "logit"),
+  data = sample_stats_with_treatment
+)
+
+summary(prop_removed.mod)
+
+# Check model diagnostics
+simulationOutput <- simulateResiduals(prop_removed.mod)
+plot(simulationOutput)
+
+# Get treatment means and pairwise comparisons
+emmeans(prop_removed.mod, ~ TREATMENT, type = "response")
+
+# Pairwise comparisons
+pairwise_prop <- emmeans(prop_removed.mod, pairwise ~ TREATMENT, type = "response")
+print(pairwise_prop)
+
+# Extract just the pairwise comparisons table
+pairwise_df <- as.data.frame(pairwise_prop$contrasts)
+print(pairwise_df)
+
+# Compact letter display
+library(multcomp)
+cld_prop <- cld(emmeans(prop_removed.mod, ~ TREATMENT, type = "response"),
+                Letters = letters,
+                adjust = "tukey")
+print(cld_prop)
+
+# Create summary table by treatment
+prop_summary <- sample_stats_with_treatment %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n_samples = n(),
+    mean_percent_removed = mean(percent_removed, na.rm = TRUE),
+    median_percent_removed = median(percent_removed, na.rm = TRUE),
+    sd_percent_removed = sd(percent_removed, na.rm = TRUE),
+    se_percent_removed = sd_percent_removed / sqrt(n()),
+    min_percent_removed = min(percent_removed, na.rm = TRUE),
+    max_percent_removed = max(percent_removed, na.rm = TRUE),
+    mean_total_reads_original = mean(total_reads_original, na.rm = TRUE),
+    mean_total_reads_removed = mean(total_reads_removed, na.rm = TRUE),
+    mean_percent_contaminant_otus = mean(percent_contaminant_otus, na.rm = TRUE)
+  )
+
+print(prop_summary)
+
+# Optional: Export results
+# write.csv(prop_summary, "proportion_removed_by_treatment_summary.csv", row.names = FALSE)
+# write.csv(pairwise_df, "proportion_removed_pairwise_comparisons.csv", row.names = FALSE)
+# write.csv(sample_stats_with_treatment, "sample_stats_with_metadata.csv", row.names = FALSE)
+```
+
+#### Negatives
+
+```{r}
+total_reads_removed_per_sample <- colSums(reads_removed[, sample_names_removed, drop = FALSE], na.rm = TRUE)
+
+# Create a data frame with sample-level removal summary
+sample_removal_summary <- data.frame(
+  SAMPLE = sample_names_removed,
+  total_reads_removed = total_reads_removed_per_sample,
+  n_contaminant_otus = colSums(reads_removed[, sample_names_removed, drop = FALSE] > 0, na.rm = TRUE),
+  max_contaminant_reads = apply(reads_removed[, sample_names_removed, drop = FALSE], 2, max, na.rm = TRUE),
+  mean_contaminant_reads = apply(reads_removed[, sample_names_removed, drop = FALSE], 2, mean, na.rm = TRUE),
+  median_contaminant_reads = apply(reads_removed[, sample_names_removed, drop = FALSE], 2, median, na.rm = TRUE),
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(total_reads_removed))
+
+# View top samples with most reads removed
+cat("\n========== TOP 20 SAMPLES WITH MOST READS REMOVED ==========\n")
+print(head(sample_removal_summary, 20))
+
+
+# Get all column names from otutab.predecon
+all_cols <- colnames(otutab.predecon)
+
+# Find control columns (ending with _EB or _PB)
+control_cols <- all_cols[grepl("_EB$|_PB$", all_cols)]
+
+cat("Found", length(control_cols), "control columns\n")
+cat("First 10 controls:\n")
+print(head(control_cols, 10))
+
+# Calculate total reads in each control column
+control_reads <- data.frame(
+  SAMPLE = control_cols,
+  total_reads = colSums(otutab.predecon[, control_cols, drop = FALSE], na.rm = TRUE),
+  n_otus = colSums(otutab.predecon[, control_cols, drop = FALSE] > 0, na.rm = TRUE),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    # Extract run, barcode, and type (EB or PB)
+    Run = ifelse(grepl("^run1", SAMPLE), 1,
+                ifelse(grepl("^run2", SAMPLE), 2,
+                ifelse(grepl("^run4", SAMPLE), 4, NA))),
+    Type = ifelse(grepl("_EB", SAMPLE), "Extraction Blank",
+                 ifelse(grepl("_PB", SAMPLE), "PCR Blank", NA)),
+    Marker = ifelse(grepl("Teleo2", SAMPLE), "Teleo2",
+                   ifelse(grepl("MiBird", SAMPLE), "MiBird", "Unknown"))
+  ) %>%
+  arrange(desc(total_reads))
+
+# View all controls ranked by contamination
+cat("\nCONTROL SAMPLES RANKED BY CONTAMINATION (highest first):\n")
+print(control_reads)
+
+# Top 10 most contaminated controls
+top_controls <- control_reads %>%
+  head(10)
+
+cat("\nTOP 10 MOST CONTAMINATED CONTROLS:\n")
+print(top_controls[, c("SAMPLE", "total_reads", "n_otus", "Run", "Type", "Marker")])
+
+# Identify the single most contaminated control
+most_contaminated <- control_reads %>%
+  slice_max(total_reads, n = 1)
+
+cat("\n★ MOST CONTAMINATED CONTROL SAMPLE ★\n")
+print(most_contaminated[, c("SAMPLE", "total_reads", "n_otus", "Run", "Type", "Marker")])
+
+# Visualizations
+
+# 1. Bar plot of top 10 controls
+ggplot(top_controls, aes(x = reorder(SAMPLE, total_reads), y = total_reads, fill = Type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Top 10 Most Contaminated Control Samples (Pre-Decontamination)",
+    x = "Control Sample",
+    y = "Total Reads",
+    fill = "Control Type"
+  ) +
+  theme_minimal() + scale_y_log10()
+
+
+# Summary statistics
+summary_stats <- control_reads %>%
+  group_by(Type) %>%
+  summarise(
+    n = n(),
+    mean_reads = mean(total_reads, na.rm = TRUE),
+    median_reads = median(total_reads, na.rm = TRUE),
+    sd_reads = sd(total_reads, na.rm = TRUE),
+    max_reads = max(total_reads, na.rm = TRUE),
+    mean_otus = mean(n_otus, na.rm = TRUE),
+    max_otus = max(n_otus, na.rm = TRUE)
+  )
+
+cat("\nSUMMARY STATISTICS BY CONTROL TYPE:\n")
+print(summary_stats)
+
+# Summary by Run
+run_stats <- control_reads %>%
+  group_by(Run) %>%
+  summarise(
+    n = n(),
+    mean_reads = mean(total_reads, na.rm = TRUE),
+    median_reads = median(total_reads, na.rm = TRUE),
+    max_reads = max(total_reads, na.rm = TRUE)
+  )
+
+cat("\nSUMMARY STATISTICS BY RUN:\n")
+print(run_stats)
+
+# Summary by Marker
+marker_stats <- control_reads %>%
+  group_by(Marker) %>%
+  summarise(
+    n = n(),
+    mean_reads = mean(total_reads, na.rm = TRUE),
+    median_reads = median(total_reads, na.rm = TRUE),
+    max_reads = max(total_reads, na.rm = TRUE)
+  )
+
+cat("\nSUMMARY STATISTICS BY MARKER:\n")
+print(marker_stats)
+
+# Export results
+#write.csv(control_reads, "control_contamination_predecon.csv", row.names = FALSE)
+
+# Find controls with reads above a threshold (e.g., > 1000 reads)
+high_contamination <- control_reads %>%
+  filter(total_reads > 1000) %>%
+  arrange(desc(total_reads))
+
+cat("\nCONTROLS WITH >1000 READS (HIGHLY CONTAMINATED):\n")
+if(nrow(high_contamination) > 0) {
+  print(high_contamination[, c("SAMPLE", "total_reads", "n_otus", "Type", "Run")])
+} else {
+  cat("None found.\n")
+}
+
+# Identify which OTUs are driving the contamination in the most contaminated control
+if(nrow(most_contaminated) > 0) {
+  most_contaminated_sample <- most_contaminated$SAMPLE[1]
+  
+  # Get the OTUs present in this control
+  control_otus <- otutab.predecon %>%
+    dplyr::select(ID, !!most_contaminated_sample) %>%
+    filter(!!sym(most_contaminated_sample) > 0) %>%
+    arrange(desc(!!sym(most_contaminated_sample)))
+  
+  cat("\nTOP OTUS IN THE MOST CONTAMINATED CONTROL (", most_contaminated_sample, "):\n", sep = "")
+  print(head(control_otus, 20))
+}
+```
+
+
+## 3. Community dissimilarity
+
+This code calculates community dissimilarity using a chosen distance method (e.g., Bray-Curtis), then runs non-metric multidimensional scaling (NMDS) to visualize how samples cluster in 2D space, with ellipses showing 95% confidence intervals for each group. It then uses envfit to identify which environmental or metadata variables are significantly correlated with the community patterns (p < 0.05), adding them as arrows to the NMDS plot to show direction and strength of influence.
+
+### MDS
+
+```{r}
+table.dist<- vegdist(community.table.t, method=distance.method, binary=F) # distance matrix from community OTU table
+metatable.reps$group_factor <- as.factor(metatable.reps[[GROUPING]]) # grouping variable for ordination
+
+set.seed(13) 
+
+NMDSdat<-metaMDS(table.dist, k=2, weakties=TRUE, maxit=1000, pc=TRUE, zerodist="add", autotransform = F) # ordination function, with k dimensions 
+
+stress_value <- round(NMDSdat$stress, 3) #extract 2D stress value (watch stress, should be < 0.15, lower the better)
+
+PDat <- data.frame(
+  NMDS1 = NMDSdat$points[, 1],
+  NMDS2 = NMDSdat$points[, 2],
+  row.names(table.t)) # creates dataframe of ordination axes results
+
+names(PDat)[3] <- SAMPLE # add in sample information
+PDat<-merge(PDat, metatable.reps, by=SAMPLE) # merge with metadata
+
+nmds.plot <- qplot(x = NMDS1, y = NMDS2, 
+                   colour = group_factor,
+                   alpha = I(0.6), 
+                   data = PDat) +  
+  geom_vline(xintercept = 0, lty = 2, col = "grey66") + 
+  geom_hline(yintercept = 0, lty = 2, col = "grey66") + 
+  stat_ellipse(aes(fill = group_factor),
+               level = 0.95, 
+               geom = "polygon", 
+               alpha = 0.15,
+               colour = NA) +  # Remove outline
+  theme_bw() +  
+  labs(colour = NULL, 
+       fill = NULL, 
+       subtitle = paste("Stress =", stress_value)) + 
+  scale_color_manual(values = cols.method) +
+  scale_fill_manual(values = cols.method)
+nmds.plot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("NMDSplot_", GROUPING,"_teleo2.pdf")),
+  plot    =nmds.plot,
+  width   =6,
+  height  =4,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+### Dispersion test
+
+Tests for homogeneity of dispersion, The p-value is greater than 0.05, indicating that the homogeneity of dispersion across the groups is not significantly different. In other words, the variation within the groups (dispersion) is similar, and there is no strong evidence to suggest that one group is more or less dispersed than the others.The lack of significance in betadisper indicates that the spread of points (dispersion) within STEP groups is not significantly different, meaning that the differences in the dissimilarities found in adonis2 are more likely due to differences in group centroids rather than differences in variability within the groups.
+
+```{r}
+# Check for variability across SITE groups
+dispersion <- betadisper(table.dist, group = metatable.reps[[GROUPING]])
+anova(dispersion) # if significant -> ANOSIM suggested over PERMANOVA
+```
+
+### Centroid tests
+
+This code runs two statistical tests to check if your groups (e.g., sites or treatments) have significantly different microbial communities. ANOSIM tests whether differences between groups are larger than differences within groups (R close to 1 = strong separation), while PERMANOVA tests if group membership explains a significant portion of the variation in community composition (p-value < 0.05 indicates significant differences).
+
+#### ANOSIM
+
+```{r}
+anosim.mod=anosim(table.dist, group = metatable.reps$group_factor, permutations = numperm)
+anosim.mod
+```
+
+#### PERMANOVA
+
+```{r}
+permanova.mod=adonis2(table.dist ~ group_factor, data = metatable.reps, permutations = numperm)
+permanova.mod 
+```
+
+## 4. Hill diversity
+
+This code calculates Hill diversity (richness at q=0, Shannon at q=1, and Simpson at q=2) for each sample using the iNEXT package, then standardizes all samples to the same coverage level (95% of the minimum coverage) for fair comparison. It produces two visualizations: group comparison plots showing diversity across your grouping variable (e.g., sites or treatments) using violin-boxplots, and a richness over time plot with a dashed line connecting medians across ordered dates.
+
+#### Calculation
+
+```{r}
+# Get total number of columns
+total_cols <- ncol(metatable.reps.reads)
+
+# Define columns to remove: first and all metadata columns
+cols_to_remove <- c(1, (total_cols - (ncol(metadata)-2)):total_cols)
+
+# Subset the data frame to keep only the other columns
+otu_df <- metatable.reps.reads[, -cols_to_remove]
+
+# Force numeric and replace NA with 0
+otu_df <- as.data.frame(lapply(otu_df, function(x) as.numeric(as.character(x))))
+rownames(otu_df) <- metatable.reps.reads[[SAMPLE]]
+
+otu_df[is.na(otu_df)] <- 0
+
+# Remove samples with zero total reads
+otu_df <- otu_df[rowSums(otu_df) > 0, ]
+
+otu_list_samples <- apply(
+  otu_df,
+  1,                # apply over rows (samples)
+  function(x) x[x > 0]   # keep only OTUs with >0 abundance
+)
+
+# Drop any remaining empty samples
+otu_list_samples <- otu_list_samples[lengths(otu_list_samples) > 0]
+otu_list_samples <- otu_list_samples[names(otu_list_samples) != ""] # remove any empty factors from the list
+
+inext_out <- iNEXT(otu_list_samples, q = c(0, 1, 2), datatype = "abundance", se = FALSE)
+```
+
+#### Minimum coverage standardization
+
+Not reliable if minimum coverage = 0.99-1.00! Do not remove singleton OTUs during bioinformatics! Use size-based (read depth) standardization instead.
+
+```{r}
+##Get coverage information
+coverage_info <- DataInfo(otu_list_samples, datatype = "abundance")
+target_coverage <- min(coverage_info$SC, na.rm = TRUE)
+  
+#coverage_info=inext_out$iNextEst$coverage_based # only want observed SC!!
+#coverage_info=subset(coverage_info, Method == "Observed")
+
+##Find the minimum coverage among samples (or choose a specific target)
+#target_coverage=min(coverage_info$SC, na.rm=TRUE) # use minimum sample coverage across all samples
+cat("Target coverage:", target_coverage, "\n")
+
+####Coverage-Standardization ####################################
+standardized.coverage=estimateD(
+  otu_list_samples,
+  q=c(0, 1, 2),
+  datatype="abundance",
+  base="coverage",  #Standardize by coverage
+ level=target_coverage, conf=0.95)
+#############################################################
+```
+
+
+#### Minimum read depth standardization
+
+Standardizes DNA reads to minimum shared read depth, while also filtering out extremely low-read samples. Set the low-read threshold cutoff to remove samples with low sequencing depth. 
+
+```{r}
+# Calculate read depths for all samples
+sample_reads <- sapply(otu_list_samples, sum)
+
+# Set your threshold (e.g., 1000 reads)
+read_threshold <- 100
+
+# Filter samples below threshold
+samples_to_keep <- names(sample_reads[sample_reads >= read_threshold])
+otu_list_filtered <- otu_list_samples[samples_to_keep]
+
+# Check how many samples were removed
+removed_samples <- length(otu_list_samples) - length(otu_list_filtered)
+cat("Removed", removed_samples, "samples with <", read_threshold, "reads\n")
+
+# Now proceed with standardization on filtered data
+sample_reads_filtered <- sapply(otu_list_filtered, sum)
+min_read_depth <- min(sample_reads_filtered)
+
+# Run iNEXT
+standardized.size <- estimateD(
+  otu_list_filtered,
+  q = c(0, 1, 2),
+  datatype = "abundance",
+  base = "size", #standardize by reads
+  level = min_read_depth
+)
+```
+
+```{r}
+hill_df_cov=standardized.coverage %>% 
+  dplyr::select(Assemblage, Order.q, qD) %>%
+  tidyr::pivot_wider(
+    names_from=Order.q,
+    values_from=qD,
+    names_prefix="Hill_q"
+  ) %>%
+  dplyr::rename(!!SAMPLE := Assemblage) %>% 
+  dplyr::rename(Richness_cov=Hill_q0) %>%
+  dplyr::rename(Shannon_cov=Hill_q1) %>%
+  dplyr::rename(Simpson_cov=Hill_q2)
+
+hill_df_size=standardized.size%>%
+  dplyr::select(Assemblage, Order.q, qD) %>%
+  tidyr::pivot_wider(
+    names_from=Order.q,
+    values_from=qD,
+    names_prefix="Hill_q"
+  ) %>%
+  dplyr::rename(!!SAMPLE := Assemblage) %>% 
+  dplyr::rename(Richness_size=Hill_q0) %>%
+  dplyr::rename(Shannon_size=Hill_q1) %>%
+  dplyr::rename(Simpson_size=Hill_q2)
+
+hill_df_ext=inext_out$AsyEst %>%
+ dplyr::select(Assemblage, Diversity, Estimator) %>%
+ tidyr::pivot_wider(
+   names_from=Diversity,
+   values_from=Estimator) %>%
+ dplyr::rename(!!SAMPLE := Assemblage) %>% 
+ dplyr::rename(Richness_ext=`Species richness`) %>%
+ dplyr::rename(Shannon_ext=`Shannon diversity`) %>%
+ dplyr::rename(Simpson_ext=`Simpson diversity`)
+
+hill_df_obs = inext_out$AsyEst %>%
+  dplyr::select(Assemblage, Diversity, Observed) %>%
+  tidyr::pivot_wider(
+    names_from = Diversity,
+    values_from = Observed
+  ) %>%
+  dplyr::rename(!!SAMPLE := Assemblage) %>% 
+  dplyr::rename(Richness = `Species richness`) %>%
+  dplyr::rename(Shannon = `Shannon diversity`) %>%
+  dplyr::rename(Simpson = `Simpson diversity`)
+
+hill_df <- hill_df_obs %>%
+  dplyr::full_join(hill_df_ext, by = SAMPLE) %>%
+  dplyr::full_join(hill_df_size, by = SAMPLE) %>%
+  dplyr::full_join(hill_df_cov, by = SAMPLE)
+
+#Merge with metadata
+alpha_div=hill_df %>%
+  left_join(metadata, by=SAMPLE)
+
+alpha_summary <- alpha_div %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n = n(),
+    Richness_mean = mean(Richness_size, na.rm = TRUE),
+    Richness_sd = sd(Richness_size, na.rm = TRUE),
+    Shannon_mean = mean(Shannon_size, na.rm = TRUE),
+    Shannon_sd = sd(Shannon_size, na.rm = TRUE),
+    Simpson_mean = mean(Simpson_size, na.rm = TRUE),
+    Simpson_sd = sd(Simpson_size, na.rm = TRUE)
+  )
+
+alpha_summary=as.data.frame(alpha_summary)
+head(alpha_summary)
+```
+
+
+#### Group diversity
+
+```{r}
+group.levels=as.factor(alpha_div[[GROUPING]])
+
+p1 <- ggplot(alpha_div, aes(x=group.levels, y=Richness_size, fill=group.levels)) +
+  geom_violin(alpha=0.5, scale = "width") + 
+  geom_point(position=position_jitter(width=0.2), size=0.8) +
+  geom_boxplot(width=0.1, outlier.shape=NA) +
+  labs(title="Richness (q=0)", x="", y="") + theme_bw() +
+  theme(legend.position="none", axis.text.x = element_text(angle=45, hjust=1)) + scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+p2 <- ggplot(alpha_div, aes(x=group.levels, y=Shannon_size, fill=group.levels)) +
+  geom_violin(alpha=0.5, scale = "width") +
+  geom_point(position=position_jitter(width=0.2), size=0.8) +
+  geom_boxplot(width=0.1, outlier.shape=NA) +
+  labs(title="Shannon (q=1)", x="", y="") +
+  theme_bw() +  theme(legend.position="none", axis.text.x = element_text(angle=45, hjust=1)) + scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+p3 <- ggplot(alpha_div, aes(x=group.levels, y=Simpson_size, fill=group.levels)) +
+  geom_violin(alpha=0.5, scale = "width") +
+  geom_point(position=position_jitter(width=0.2), size=0.8) +
+  geom_boxplot(width=0.1, outlier.shape=NA) +
+  labs(title="Simpson (q=2)", x="", y="") +
+theme_bw() +  theme(legend.position="none", axis.text.x = element_text(angle=45, hjust=1)) + scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method)
+
+alphaplot <- ggarrange(p1, p2, p3, ncol=3)
+alphaplot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("alphaplot_", GROUPING, "teleo2.pdf")),
+  plot    =alphaplot,
+  width   =8,
+  height  =5,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+## 5. Sampling effort
+
+This code creates two types of accumulation curves: a sequence depth rarefaction curve showing how many distinct organisms (MOTUs) you detect as you sequence more reads per sample, and sample rarefaction curves showing how taxonomic coverage increases as you include more samples. The sample curves are generated both for all data combined and separately for different groups (defined by your GROUPING variable, like sites or treatments), using the iNEXT package to interpolate and extrapolate the curves with confidence intervals.
+
+### Sequence depth rarefaction
+
+```{r}
+rarecurve(table.reads.t, step = 1000, col = rainbow(nrow(table.reads.t)), label = F, xlab = "Sequence Depth",  ylab = "MOTUs")
+```
+
+### Sample rarefaction
+
+#### Overall
+
+```{r}
+# Combine data from all sites and steps into a single dataset
+# Transpose and clean the data
+smallset_combined <- t(metatable.reps[, c(2:ntax)])
+
+# Remove samples with zero reads
+smallset_combined <- smallset_combined[rowSums(smallset_combined) > 0, ]
+
+# Remove MOTUs with zero reads across all samples
+smallset_combined <- smallset_combined[, colSums(smallset_combined) > 0]
+
+# Convert to presence-absence
+smallset_combined <- decostand(smallset_combined, method = "pa")
+
+# Create a list with the combined dataset
+otu_list_combined <- list("Combined" = smallset_combined)
+
+out_combined <- iNEXT(otu_list_combined, q = 0, datatype = "incidence_raw", se = TRUE)
+
+info_samples <- DataInfo(otu_list_combined, datatype="incidence_raw")
+min_coverage_samples <- min(info_samples$SC)
+
+rarecurve_combined <- ggiNEXT(out_combined, type = 2, se = TRUE, facet.var = "None", color.var = "Order.q") 
+
+rarecurve.overall=rarecurve_combined+ theme_bw() + xlab("Sample effort") + ylab("Coverage")
+
+rarecurve.overall=rarecurve.overall + ylim(0,1) 
+
+rarecurve.overall
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("rarecurve_teleo2.pdf")),
+  plot    =rarecurve.overall,
+  width   =8,
+  height  =5,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+#### By grouping variable
+
+##### Spatial
+
+```{r}
+# Get unique groups from your metadata
+unique_groups <- unique(metadata[[GROUPING]])
+
+# Create an empty list to store processed data for each group
+otu_list <- list()
+
+for(group in unique_groups) {
+  # Get samples for this group
+  samples_in_group <- metadata[metadata[[GROUPING]] == group, SAMPLE]
+  
+  # Subset and transpose (preserve matrix structure)
+  temp_obj <- t(metatable.reps.reads[metatable.reps.reads[[SAMPLE]] %in% samples_in_group, c(2:ntax), drop = FALSE])
+  
+  # REMOVE INDIVIDUALS WITH ZERO SEQUENCE READS (rows with all zeros)
+  temp_obj <- temp_obj[rowSums(temp_obj != 0) > 0, , drop = FALSE]
+  
+  # Skip if no rows remaining
+  if(nrow(temp_obj) == 0) next
+  
+  # REMOVE MOTUS WITH ZERO SUMS (columns that sum to zero)
+  temp_obj <- temp_obj[, colSums(temp_obj) != 0, drop = FALSE]
+  
+  # Skip if no columns remaining
+  if(ncol(temp_obj) == 0) next
+  
+  # Convert to presence/absence
+  temp_obj <- decostand(temp_obj, method = "pa")
+  
+  otu_list[[group]] <- temp_obj
+}
+
+otu_list <- otu_list[sapply(otu_list, length) > 0] 
+otu_list <- otu_list[names(otu_list) != ""] # remove any empty factors from the list
+
+# Now proceed with iNEXT analysis
+out.site <- iNEXT(otu_list, q=0, datatype="incidence_raw", se=T, endpoint = 120)
+
+# Get data info
+info_sites <- DataInfo(otu_list, datatype="incidence_raw")
+min_coverage_sites <- min(info_sites$SC)
+
+# Create rarefaction curve
+rarecurve.site <- ggiNEXT(out.site, type=2, se=T, facet.var="None", 
+                          color.var="Assemblage", grey=FALSE)
+
+rarecurve.site.plot=rarecurve.site + theme_bw() + xlab("Sample effort") + ylab("Coverage") + ylim(0,1)
+
+rarecurve.site.plot + scale_color_manual(values = cols.method) + scale_fill_manual(values = cols.method) + ylim(0,1)
+
+site.summary=out.site$AsyEst
+site.summary
+
+# Get the iNEXT output as a data frame
+rare_data <- fortify(out.site, type=2)  # Extract data
+
+# Ensure group names match your metadata
+# Create color mapping
+color_mapping <- cols.method[names(cols.method) %in% unique(rare_data$Assemblage)]
+
+# Plot manually using ggplot
+rarecurve.site.plot <- ggplot(rare_data, aes(x = x, y = y, color = Assemblage, fill = Assemblage)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = y.lwr, ymax = y.upr), alpha = 0.2, color = NA) + 
+  theme_bw() +
+  xlab("Sample effort") +
+  ylab("Coverage") +
+  ylim(0,1) +
+  scale_color_manual(values = cols.method) +
+  scale_fill_manual(values = cols.method) +
+  labs(color = GROUPING, fill = GROUPING)
+
+rarecurve.site.plot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("rarecurve_", GROUPING, "_teleo2.pdf")),
+  plot    =rarecurve.site.plot,
+  width   =8,
+  height  =5,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+## 6. Indicator taxa
+This code aggregates OTUs by a higher taxonomic rank (e.g., genus or family), then runs indicator species analysis (IndVal) to identify which taxa are significantly associated with specific groups (e.g., sites or treatments). It filters significant indicators (adjusted p < 0.15), then creates a faceted time-series plot showing how the abundance of each indicator taxon changes over time, with separate panels for each group and each indicator taxon, using violin-boxplots and a dashed line connecting medians.
+
+More info:
+The indicator species analysis uses an index called Indicator Value (the square root of the
+indicator value is shown on the generated table under column “stat”) which is the product of
+two components also shown on the table: A and B.
+A is the probability that a site is in the target group given that the species has been found. It
+is the mean abundance of species in the target group divided by the sum of the mean
+abundance values over all groups. Horsetail (EQUI.SPPS) has an A value of 1 because it
+only occurs in the loamy-sand ecosite.
+B is the probability that you will find the species in a site that is in the target site group. B is
+the relative frequency of occurrence of the species in the target group. Western wheatgrass
+(PASC.SMI) has a B value of 1 because it occurs in every loam site. Sandgrass
+(CALA.LON) has a B value of 1 because it occurs in every loamy-sand site. A high B value
+means that if you do not find the species at a given site, the probability that the site belongs
+to the target group is low.
+The indicator value is maximum (i.e. 1) when all individuals of a species are found in a
+single group of sites and when the species occurs in all sites of that group. Western
+wheatgrass, Sandgrass, and Horsetail seem to be strong indicators of their groups because
+the square root of their indicator values are all nearly 1. They have high associations to their
+site groups.
+
+### Aggregate OTU table
+
+```{r}
+group=as.factor(metatable.reps[[GROUPING]])
+taxonomic.rank=community.data[[TAXONOMICRANK]] 
+
+com=community.table.t
+
+colnames(com)=taxonomic.rank
+
+prefixes = unique(sub("\\..*", "", colnames(com)))
+prefixes = prefixes[prefixes != ""]
+
+com=sapply(prefixes, function(x) rowSums(com[,startsWith(colnames(com), x), drop=F])) ##OTU table with combined taxonomies (no repeated columns)
+
+com=as.data.frame(com)
+
+ncom=ncol(com)
+```
+
+### IndVal analysis
+
+```{r}
+##BY SITE
+# Run indicator species analysis
+indval.site = multipatt(com, group, control = how(nperm = numperm), duleg = T, func="r.g")
+
+# View summary
+summary(indval.site)
+
+# Extract results as a dataframe
+summary_result = as.data.frame(indval.site$sign)
+
+# Extract p-values from the results
+pvals <- indval.site$sign$p.value
+
+# Adjust p-values using Benjamini-Hochberg (FDR) correction
+pvals_adj <- p.adjust(pvals, method = "BH")
+
+# Add adjusted p-values back to results
+summary_result$p.adjusted <- pvals_adj
+
+# Filter significant species after correction (adjusted p-value < 0.05)
+significant_species <- summary_result[pvals_adj < 0.05, ]
+
+# Get the site/group that each indicator taxa is associated with
+# For each row in significant_species, find which "s." column has value 1
+indicator_groups <- apply(significant_species[, grep("^s\\.", names(significant_species))], 1, function(x) {
+  # Find column names where value is 1
+  sites <- names(x)[x == 1]
+  # Remove the "s." prefix
+  sites <- gsub("^s\\.", "", sites)
+  # If multiple sites, combine with comma, otherwise return single site
+  if(length(sites) > 1) {
+    return(paste(sites, collapse = ", "))
+  } else if(length(sites) == 1) {
+    return(sites)
+  } else {
+    return(NA)
+  }
+})
+
+# Add this information to significant_species
+significant_species$indicator_group <- indicator_groups
+significant_species$indicator_taxon <- rownames(significant_species)
+
+significant_species
+```
+
+
+## 7. Heatmap
+
+```{r}
+# ============================================
+# HEATMAP - LOG-TRANSFORMED SUMMED READS BY TREATMENT
+# ============================================
+
+library(pheatmap)
+
+# Match samples
+common_samples <- intersect(rownames(com), metadata[[SAMPLE]])
+com_subset <- com[common_samples, ]
+metadata_subset <- metadata[match(common_samples, metadata[[SAMPLE]]), ]
+
+# Sum reads by treatment
+sum_by_treatment <- aggregate(com_subset, 
+                              by = list(Treatment = metadata_subset$TREATMENT), 
+                              FUN = sum)
+
+# Set treatment as rownames and remove the Treatment column
+rownames(sum_by_treatment) <- sum_by_treatment$Treatment
+sum_by_treatment <- sum_by_treatment[, -1]
+
+# Transpose so taxa are rows, treatments are columns
+heatmap_data <- t(sum_by_treatment)
+
+# Optional: Remove taxa with zero reads across all treatments
+#heatmap_data <- heatmap_data[rowSums(heatmap_data) > 0, ]
+
+# Log transform (log1p = log(1+x) to handle zeros)
+heatmap_data_log <- log1p(heatmap_data)
+
+# Create heatmap (no scaling)
+heatmap=pheatmap(heatmap_data_log,
+         scale = "none", fontsize_row = 8,
+         fontsize_col = 10,
+         angle_col = 45,
+         cellwidth = 30,
+         cellheight = 10,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         cluster_rows = T,
+         cluster_cols = F,
+         color = colorRampPalette(c("white", "tan", "firebrick3"))(100))
+heatmap
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("heatmap_", GROUPING, "_teleo2.pdf")),
+  plot    =heatmap,
+  width   =6,
+  height  =12,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial")
+```
+

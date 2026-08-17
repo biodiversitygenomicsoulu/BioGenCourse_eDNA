@@ -1,0 +1,1268 @@
+---
+title: "eDNA Course - Diversity analysis"
+author: "Patrick Nichols"
+date: "2026-07-02"
+output: html_document
+---
+
+## 1. Setup
+
+Session -> Set working directory -> To source file location...
+
+Carefully update the user-defined settings for each run, making sure column names and index positions match.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(iNEXT)
+library(vegan)
+library(ggpubr)
+library(indicspecies)
+library(microDecon)
+library(purrr)
+library(tibble)
+library(readxl)
+
+My_Theme = theme_set(theme_bw()+theme(
+  panel.grid.minor = element_blank(),
+  panel.background = element_blank(), 
+  panel.border = element_rect(fill=NA, colour = "black"), 
+  panel.spacing = unit(1, "lines"),
+  axis.title.x = element_text(size = 12, color="black"),
+  axis.text.x = element_text(size = 12, color="black"),
+  axis.title.y = element_text(size = 12, color = "black"),
+  axis.text.y = element_text(size=12, color = "black"),
+  legend.text = element_text(size=12, color = "black"),
+  strip.text.x = element_text(size=14, color="black"),
+  strip.text.y = element_text(size=14, color="black"),
+  strip.text = element_text(size = 14, color = "black"),
+  strip.background = element_blank(), 
+  strip.placement = "outside",
+  title = element_text(size=14, color="black", face="bold"),
+  axis.title = element_text(size=12, face="bold", colour = "black"),
+  axis.text = element_blank()))
+
+set.seed(13)
+numperm=9999 #Permutation tests
+
+paths=list(
+  data_raw      ="data/raw",
+  data_processed="data/processed",
+  results_rds   ="results/rds",
+  results_tables="results/tables",
+  results_figs  ="results/figures"
+)
+
+walk(paths, dir.create, showWarnings = FALSE, recursive = TRUE)
+
+cols.method=c("#031d44", "#1a659e", "#d5896f", "#dab785", "#70a288", "snow3", "black")
+
+#### RUN SETTINGS #######################################################
+num.blanks=27 # how many columns of blanks/negative control samples?
+SAMPLE="Sample_ID" # name of metadata column with sample IDs
+OTU_ID="OTU_ID" # name of OTU ID column in OTU table
+GROUPING="TREATMENT" # name of grouping variable column in metadata
+TAXONOMICRANK= "Genus" # choose taxonomic rank for indicator taxon analysis
+distance.method="bray" #choose distance method for community dissimilarity ordination
+#########################################################################
+
+#### READ IN OTU TABLE ##################################################
+otutab.raw=read_excel(file.path(paths$data_raw, "combined_data_read_table.xlsx"))  # raw OTU table, with Unique ID/OTU_ID as first column, apscale taxonomic information
+otutab.predecon=otutab.raw[,c(1:257)] # select only OTU ID and numerical read count columns
+otutab.predecon[, -1] <- lapply(otutab.predecon[, -1], function(x) {
+  if(is.character(x)) as.numeric(trimws(x)) else x
+})
+# Remove zero-sum rows (keep ID column)
+otutab.predecon <- otutab.predecon[rowSums(otutab.predecon[, -1]) != 0, ]
+# Remove zero-sum columns (keep ID column)
+otutab.predecon <- otutab.predecon[, c(1, which(colSums(otutab.predecon[, -1]) != 0) + 1)]
+apscale.info=otutab.raw[,c(1,258:ncol(otutab.raw))] # select taxonomic info and other columns from apscale
+#########################################################################
+
+#### READ IN METADATA FILE #############################################
+metadata=read_excel(file.path(paths$data_raw, "metadata.xlsx"))
+metadata=subset(metadata, Run != "1")
+metadata=subset(metadata, SITE=="Station2" | SITE=="Station3")
+metadata=subset(metadata, SITE != "Control")
+#metadata=subset(metadata, SAMPLE != "Teleo2_run4_barcode65" | SAMPLE != "Teleo2_run4_barcode68" | SAMPLE != "Teleo2_run2_barcode81") # failed samples?
+metadata$QUBIT <- as.numeric(gsub(",", ".", trimws(metadata$QUBIT)))
+#######################################################################
+```
+
+### Decontamination
+
+#### MicroDecon
+
+```{r}
+otutab.predecon <- as.data.frame(otutab.predecon)
+
+# Run decontamination
+microdecon.decontaminated <- decon(otutab.predecon,numb.blanks = num.blanks, numb.ind = (ncol(otutab.predecon)-num.blanks-1),taxa = FALSE,thresh = 1,prop.thresh = 0, runs = 2)
+
+reads.removed=microdecon.decontaminated$reads.removed
+decontaminated.table <- microdecon.decontaminated$decon.table
+decontaminated.table$Mean.blank <- NULL
+
+reads.removed=microdecon.decontaminated$reads.removed
+reads.removed=merge(apscale.info, reads.removed, by=OTU_ID)
+
+decontaminated.table.metadata=merge(decontaminated.table, apscale.info, by=OTU_ID) # merge taxonomic info back into decontaminated file
+
+write.csv(decontaminated.table.metadata, file=file.path(paths$data_processed, "decontaminated_data.csv"), row.names = F) ## save to PC
+```
+
+
+### Data cleaning and prepping
+
+This block removes human-related taxa (genus Homo) from the dataset and renames the rows using organism IDs. It then isolates the taxonomic classification columns into a separate table called 'taxa'.
+
+```{r}
+otutab=decontaminated.table.metadata
+
+# Filter unwanted taxa
+data=subset(otutab, Order !="Primates") # if taxonomy information is present in OTU table
+data=subset(data, Kingdom !="NoMatch") # if taxonomy information is present in OTU table
+data=subset(data, Genus !="Cranioleuca") # if taxonomy information is present in OTU table
+
+
+row.names(data)=data[[OTU_ID]]
+final=data[,2:230] # Update me!!
+rownames(final)=data[["OTU_ID"]]
+
+final.t=as.data.frame(t(final))
+final.t[[SAMPLE]]=rownames(final.t)
+final.t.meta=merge(final.t, metadata, by=SAMPLE)
+
+final.t=final.t.meta[,2:(nrow(data)+1)]
+rownames(final.t)=final.t.meta[[SAMPLE]]
+
+final=as.data.frame(t(final.t))
+final <- final[, colSums(final) != 0] # remove zero sum columns
+final <- final[rowSums(final) != 0, ] # remove zero sum rows
+#final <- final[, colSums(final != 0) > 1] # remove samples with only 1 OTU
+ntax=nrow(final)
+nsample=ncol(final)
+final[[OTU_ID]]=rownames(final)
+
+final=merge(final, apscale.info, by=OTU_ID)
+rownames(final)=final[[OTU_ID]]
+
+# Taxonomic metadata only
+taxa=final[, (nsample+2):ncol(final)]
+rownames(taxa)=final[[OTU_ID]]
+taxa[[OTU_ID]]=rownames(taxa)
+```
+
+
+### Transformations
+
+This code prepares three versions of your OTU table (raw counts, Hellinger-transformed, and eDNA index), then lets you choose one for downstream analysis. The final steps transpose the table so taxa become columns and samples become rows, then merges it with site metadata for statistical testing.
+
+#### Raw Reads (no transformation)
+
+```{r}
+# Raw reads OTU table only, no metadata
+table.raw=final[, 2:(nsample+1)]
+final_reads=final # make a copy for raw reads (will not undergo transformations)
+table.reads=final_reads[,2:(nsample+1)]
+
+sum(table.reads)
+
+table.reads.t <- as.data.frame(t(table.reads))  # Flip OTU table so taxa as columns
+
+table.reads.t[[SAMPLE]] <- row.names(table.reads.t) # add sample column to merge with metadata
+metatable.reps.reads=merge(table.reads.t, metadata, by=SAMPLE) ##OTU table with site metadata correctly formatted for downstream analyses
+
+table.reads.t[[SAMPLE]]=NULL #remove non-numeric columns for downstream analyses
+```
+
+#### Presence-Absence (Binary) 
+
+```{r}
+table_pa=decostand(table.reads, method = "pa")
+table_pa[[OTU_ID]]=rownames(table_pa)
+final_pa=merge(table_pa, taxa, by=OTU_ID)
+rownames(final_pa)=final_pa[[OTU_ID]]
+table_pa[[OTU_ID]]=NULL
+table_pa.t=t(table_pa)
+```
+
+#### Hellinger 
+
+```{r}
+table_hel=decostand(table.reads, method = "hellinger")
+table_hel[[OTU_ID]]=rownames(table_hel)
+final_hel=merge(table_hel, taxa, by=OTU_ID)
+rownames(final_hel)=final_hel[[OTU_ID]]
+table_hel[[OTU_ID]]=NULL
+table_hel.t=t(table_hel)
+```
+
+#### eDNA Index
+
+```{r}
+table.raw <- as.matrix(table.reads)  # Compute relative abundance per sample (column-wise)
+relative_abundance <- sweep(table.raw, 2, colSums(table.raw), "/")  # Find the maximum observed abundance for each OTU across all samples (row-wise)
+max_relative_abundance <- apply(relative_abundance, 1, max, na.rm = TRUE)  # Compute the eDNA index by dividing each OTU's abundance by its max
+table_index <- as.data.frame(sweep(relative_abundance, 1, max_relative_abundance, "/"))  # Add OTU IDs back to the table
+
+table_index[[OTU_ID]] <- rownames(table_index) # Merge with taxa metadata (assuming 'taxa' has OTU_ID as key)
+final_index <- merge(table_index, taxa, by = OTU_ID) # Ensure row names match OTU_ID
+rownames(final_index) <- final_index[[OTU_ID]] 
+table_index[[OTU_ID]] <- NULL
+table_index.t=t(table_index)
+```
+
+#### Prepare community data
+
+```{r}
+####CHOOSE MATRIX###################################################
+community.table.t=table_index.t #transposed otu table version (OPTIONS: table_index.t, table_hel.t, table.reads.t, table_pa.t)
+community.table=table_index #otu table only (OPTIONS: table_index, table_hel, table.reads, table_pa, etc.)
+community.data=final_index #version with metadata (OPTIONS: final_index, final_hel, final_reads, final_pa, etc.)
+###################################################################
+```
+
+#### Merge filtered metadata
+
+```{r}
+table.t <- as.data.frame(t(as.matrix(community.table)))
+
+ntax=ncol(table.t)
+nsample=nrow(table.t)
+
+table.t[[SAMPLE]]=row.names(table.t) ##OTU table only
+
+# Remove leading zeros from SAMPLE column
+metatable.reps=merge(table.t, metadata, by=SAMPLE) ##OTU table with site metadata
+table.t[[SAMPLE]]=NULL
+```
+
+
+####Melt data long format
+
+```{r}
+data_long <- as.data.frame(community.table.t) %>%
+  rownames_to_column(var = SAMPLE) %>%
+  pivot_longer(
+    cols = -SAMPLE,  # Keep SampleID as identifier
+    names_to = OTU_ID,
+    values_to = "abundance"
+  )
+
+# Remove zero abundances (optional)
+data_long <- data_long %>%
+  filter(abundance > 0)
+
+data_long=merge(data_long, metadata, by=SAMPLE)
+data_long=merge(data_long, apscale.info, by=OTU_ID)
+```
+
+## 2. Treatment Summaries
+
+### Total DNA Concentration
+
+#### Plot
+
+```{r}
+# Create a distinct sample-level dataset for QUBIT values
+qubit_by_sample <- data_long %>%
+  distinct(!!sym(SAMPLE), .keep_all = TRUE) 
+
+# OR, if you want to be more explicit:
+qubit_by_sample <- data_long %>%
+  dplyr::select(SAMPLE, Run, TREATMENT, FILTRATION, EXTRACTION, QUBIT, SITE) %>%
+  distinct()
+
+qubit_by_sample %>% 
+  group_by(Run) %>% 
+  summarise(total_qubit = sum(as.numeric(trimws(QUBIT)), na.rm = TRUE))
+
+# By Treatment - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(TREATMENT) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By Filtration - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(FILTRATION) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By Extraction - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(EXTRACTION) %>% 
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE))
+
+# By all four factors - QUBIT summary (corrected)
+qubit_by_sample %>% 
+  group_by(TREATMENT, FILTRATION, EXTRACTION, Run) %>% 
+  summarise(
+    total_qubit = sum(QUBIT, na.rm = TRUE),
+    mean_qubit = mean(QUBIT, na.rm = TRUE),
+    n = n()
+  ) %>% 
+  arrange(desc(total_qubit))
+
+# Sum QUBIT across treatments and runs (corrected)
+qubit_by_sample %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(total_qubit = sum(QUBIT, na.rm = TRUE)) %>%
+  pivot_wider(names_from = Run, values_from = total_qubit, values_fill = 0)
+
+# Overall summary by Treatment - QUBIT (corrected)
+qubit_by_sample %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    total = sum(QUBIT, na.rm = TRUE),
+    mean = mean(QUBIT, na.rm = TRUE),
+    median = median(QUBIT, na.rm = TRUE),
+    min = min(QUBIT, na.rm = TRUE),
+    max = max(QUBIT, na.rm = TRUE),
+    sd = sd(QUBIT, na.rm = TRUE),
+    n = n()
+  )
+
+# By TREATMENT - Boxplot with jitter (QUBIT) - CORRECTED
+meanqubitplot=ggplot(qubit_by_sample, aes(x = TREATMENT, y = QUBIT, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +  
+  geom_boxplot(width = 0.2, alpha = 0.7) +     
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  labs(x = "",
+    y = "DNA Concentration (ng/μL)"
+  ) +
+  My_Theme +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + 
+  scale_fill_manual(values = cols.method) +
+  scale_y_log10(
+    breaks = c(0.01, 0.1, 1, 10, 100, 1000),
+    labels = scales::label_number(accuracy = 0.01)
+  ) 
+
+meanqubitplot
+```
+
+#### Model
+
+```{r}
+library(dplyr)
+library(FSA)
+library(rcompanion)
+library(multcompView)
+
+kruskal_qubit <- kruskal.test(QUBIT ~ TREATMENT, data = qubit_by_sample)
+print(kruskal_qubit)
+
+dunn_qubit <- dunnTest(QUBIT ~ TREATMENT, 
+                         data = qubit_by_sample, 
+                         method = "bh")
+print(dunn_qubit)
+
+# Create compact letter display
+treatments <- unique(qubit_by_sample$TREATMENT)
+p_matrix <- matrix(1, nrow = length(treatments), ncol = length(treatments),
+                   dimnames = list(treatments, treatments))
+
+for (i in 1:nrow(dunn_qubit$res)) {
+  comp <- strsplit(dunn_qubit$res$Comparison[i], " - ")[[1]]
+  p_val <- dunn_qubit$res$P.adj[i]
+  p_matrix[comp[1], comp[2]] <- p_val
+  p_matrix[comp[2], comp[1]] <- p_val
+}
+diag(p_matrix) <- 1
+
+library(multcompView)
+cld <- multcompLetters(p_matrix, threshold = 0.05)
+letters_df <- data.frame(
+  TREATMENT = names(cld$Letters),
+  letters = cld$Letters
+)
+print(letters_df)
+```
+
+
+### Read abundance
+
+#### Plot
+
+```{r}
+# By Run
+aggregate(abundance ~ Run, data = data_long, FUN = sum)
+# or with dplyr
+library(dplyr)
+data_long %>% group_by(Run) %>% summarise(total_abund = sum(abundance))
+
+# By Treatment
+data_long %>% group_by(TREATMENT) %>% summarise(total_abund = sum(abundance))
+
+# By Filtration
+data_long %>% group_by(FILTRATION) %>% summarise(total_abund = sum(abundance))
+
+# By Extraction
+data_long %>% group_by(EXTRACTION) %>% summarise(total_abund = sum(abundance))
+
+# By all four factors
+data_long %>% 
+  group_by(TREATMENT, FILTRATION, EXTRACTION, Run) %>% 
+  summarise(
+    total_abund = sum(abundance),
+    mean_abund = mean(abundance),
+    n = n()
+  ) %>% 
+  arrange(desc(total_abund))
+
+# Sum abundance across treatments and runs
+data_long %>%
+  group_by(TREATMENT, Run) %>%
+  summarise(total_abund = sum(abundance)) %>%
+  pivot_wider(names_from = Run, values_from = total_abund, values_fill = 0)
+
+# Overall summary by Treatment
+data_long %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    total = sum(abundance),
+    mean = mean(abundance),
+    median = median(abundance),
+    min = min(abundance),
+    max = max(abundance),
+    sd = sd(abundance),
+    n = n()
+  )
+
+data_long <- data_long %>%
+  mutate(Run = as.factor(Run))
+
+#  By TREATMENT - Boxplot with jitter
+meanreadabund=ggplot(data_long, aes(x = TREATMENT, y = abundance, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +  # Added this line
+  geom_boxplot(width = 0.2, alpha = 0.7) +     # Changed width from default to 0.2
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  scale_y_log10() +
+  labs(x = "",
+    y = "Read Abundance"
+  ) +
+  My_Theme +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_fill_manual(values = cols.method)  +
+  scale_y_log10(
+    breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000),
+    labels = scales::label_number(accuracy = 1)
+  )
+
+meanreadabund
+```
+
+
+#### Model
+
+```{r}
+# Alternative method using multcomp
+library(multcomp)
+data_long$TREATMENT <- as.factor(data_long$TREATMENT)
+
+# Fit the model
+nb_model <- glm.nb(abundance ~ TREATMENT, data = data_long)
+
+# Create contrast matrix for all pairwise comparisons
+tukey_contrasts <- glht(nb_model, linfct = mcp(TREATMENT = "Tukey"))
+
+# Get compact letter display
+cld_result <- cld(tukey_contrasts, level = 0.05)
+print(cld_result)
+
+# Extract letters as data frame
+letters_df_multcomp <- data.frame(
+  TREATMENT = names(cld_result$mcletters$Letters),
+  letters = cld_result$mcletters$Letters
+)
+print(letters_df_multcomp)
+```
+
+
+### Contamination
+
+#### ASVs
+
+```{r}
+removed.reads.data=reads.removed
+
+# Get sample column names
+sample_cols <- names(removed.reads.data)[17:ncol(removed.reads.data)] 
+
+# Reshape to long format
+removed_long <- removed.reads.data %>%
+  # Keep OTU_ID and taxonomic info for reference (optional)
+  select(OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species, all_of(sample_cols)) %>%
+  # Pivot to long format
+  pivot_longer(
+    cols = all_of(sample_cols),
+    names_to = SAMPLE,
+    values_to = "count"
+  ) %>%
+  # Filter out NA and zero counts (ASVs not present)
+  filter(!is.na(count) & count > 0)
+
+# Extract sample-treatment mapping from your existing data_long
+sample_treatment_map <- data_long %>%
+  select(Sample_ID, TREATMENT,SITE) %>%
+  distinct()
+
+# Join with removed_long
+removed_long <- removed_long %>%
+  left_join(sample_treatment_map, by = SAMPLE)
+
+removed_long=removed_long%>%
+  drop_na(TREATMENT)
+
+# Count ASVs per sample (richness)
+asv_richness <- removed_long %>%
+  group_by(Sample_ID, TREATMENT) %>%
+  summarise(
+    n_ASVs = n_distinct(OTU_ID),  # Number of unique ASVs present
+    total_reads = sum(count),      # Optional: total contaminant reads
+    .groups = 'drop'
+  )
+
+# View
+head(asv_richness)
+
+# Boxplot by treatment
+ggplot(asv_richness, aes(x = TREATMENT, y = n_ASVs, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  labs(
+    x = "",
+    y = "Contnaminant ASVs"
+  ) +
+  My_Theme +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_fill_manual(values = cols.method)
+
+# Summary statistics by treatment
+asv_richness %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n_samples = n(),
+    mean_ASVs = round(mean(n_ASVs), 1),
+    sd_ASVs = round(sd(n_ASVs), 1),
+    median_ASVs = median(n_ASVs),
+    min_ASVs = min(n_ASVs),
+    max_ASVs = max(n_ASVs)
+  )
+```
+
+#### Reads
+
+```{r}
+# 1. Calculate total contaminant reads per sample
+contaminant_reads <- removed_long %>%
+  group_by(Sample_ID, TREATMENT) %>%
+  summarise(
+    total_contaminant_reads = sum(count, na.rm = TRUE),
+    n_contaminant_ASVs = n_distinct(OTU_ID),
+    .groups = 'drop'
+  )
+
+# View the data
+head(contaminant_reads)
+
+# 2. Summary statistics by treatment
+contaminant_reads %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n_samples = n(),
+    mean_reads = round(mean(total_contaminant_reads), 1),
+    sd_reads = round(sd(total_contaminant_reads), 1),
+    median_reads = median(total_contaminant_reads),
+    min_reads = min(total_contaminant_reads),
+    max_reads = max(total_contaminant_reads),
+    mean_ASVs = round(mean(n_contaminant_ASVs), 1),
+    median_ASVs = median(n_contaminant_ASVs)
+  )
+
+readsremoved=ggplot(contaminant_reads, aes(x = TREATMENT, y = total_contaminant_reads, fill = TREATMENT)) +
+  geom_violin(alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white") +
+  scale_y_log10(
+    breaks = c(1, 10, 100, 1000, 10000),
+    labels = scales::label_number(accuracy = 1)
+  ) +
+  labs(
+    x = "",
+    y = "Reads Removed"
+  ) +
+  My_Theme +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_fill_manual(values = cols.method)
+
+readsremoved
+```
+
+#### Model
+
+```{r}
+library(glmmTMB)
+contamload.mod=glmmTMB(count ~ TREATMENT + (1|SITE),
+        family=nbinom2,
+        data=removed_long)
+contamload.mod
+summary(contamload.mod)
+
+# Install if needed
+# install.packages("emmeans")
+
+library(emmeans)
+
+# Get estimated marginal means for treatments
+emm <- emmeans(contamload.mod, ~ TREATMENT)
+
+# Get pairwise comparisons with CLD
+cld_results <- cld(emm, 
+                   Letters = letters,        # Use lowercase letters
+                   adjust = "tukey",         # Multiple comparison adjustment
+                   alpha = 0.05)             # Significance level
+
+# View results
+print(cld_results)
+
+# Alternative with more options
+cld(emm, 
+    Letters = letters,
+    adjust = "tukey",
+    alpha = 0.05,
+    reversed = TRUE,        # Reverse letter order if desired
+    sort = TRUE)            # Sort by estimate
+```
+
+### Plotted together
+
+```{r}
+dnaabundplot=ggarrange(meanqubitplot, meanreadabund, readsremoved, nrow = 3, labels = "AUTO")
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("DNA_abundance_", GROUPING,".pdf")),
+  plot    =dnaabundplot,
+  width   =7,
+  height  =14,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+
+## 3. Community dissimilarity
+
+This code calculates community dissimilarity using a chosen distance method (e.g., Bray-Curtis), then runs non-metric multidimensional scaling (NMDS) to visualize how samples cluster in 2D space, with ellipses showing 95% confidence intervals for each group. It then uses envfit to identify which environmental or metadata variables are significantly correlated with the community patterns (p < 0.05), adding them as arrows to the NMDS plot to show direction and strength of influence.
+
+
+```{r}
+table.dist<- vegdist(community.table.t, method=distance.method, binary=F) # distance matrix from community OTU table
+
+metatable.reps$group_factor <- as.factor(metatable.reps[[GROUPING]]) # grouping variable for ordination
+
+PDAT_MiBird=read.csv(file = file.path(paths$data_processed, "NMDS_data_MiBird.csv"), header=T)
+PDAT_MiBird$Marker="MiBird"
+PDAT_Teleo2=read.csv(file = file.path(paths$data_processed, "NMDS_data_Teleo2.csv"), header=T)
+PDAT_Teleo2$Marker="Teleo2"
+
+PDAT=rbind(PDAT_MiBird, PDAT_Teleo2)
+
+facet_labels <- c(
+  "MiBird" = "MiBird (Stress = 0.08)",
+  "Teleo2" = "Teleo2 (Stress = 0.15)"
+)
+
+# Rename the Marker factor
+PDAT$Marker_label <- factor(PDAT$Marker, 
+                            levels = c("MiBird", "Teleo2"),
+                            labels = c("MiBird (Stress = 0.08)", "Teleo2 (Stress = 0.15)"))
+
+nmds.plot <- ggplot(PDAT, aes(x = NMDS1, y = NMDS2, colour = group_factor)) +
+  geom_vline(xintercept = 0, lty = 2, col = "grey66") + 
+  geom_hline(yintercept = 0, lty = 2, col = "grey66") + 
+  geom_point(alpha = 0.6, size = 2) +
+  stat_ellipse(aes(fill = group_factor),
+               level = 0.95, 
+               geom = "polygon", 
+               alpha = 0.15,
+               colour = NA) +
+  facet_wrap(~ Marker_label, scales = "free", ncol = 2) +
+  My_Theme +  
+  labs(colour = NULL, 
+       fill = NULL) + 
+  scale_color_manual(values = cols.method) +
+  scale_fill_manual(values = cols.method)
+nmds.plot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("NMDSplot_", GROUPING,".pdf")),
+  plot    =nmds.plot,
+  width   =9,
+  height  =4,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+## 4. Hill diversity
+
+This code calculates Hill diversity (richness at q=0, Shannon at q=1, and Simpson at q=2) for each sample using the iNEXT package, then standardizes all samples to the same coverage level (95% of the minimum coverage) for fair comparison. It produces two visualizations: group comparison plots showing diversity across your grouping variable (e.g., sites or treatments) using violin-boxplots, and a richness over time plot with a dashed line connecting medians across ordered dates.
+
+#### Calculation
+
+```{r}
+# Remove any species (rows) that were never detected
+table_pa_clean <- table_pa[rowSums(table_pa) > 0, ]
+
+# Remove any sites (columns) with no species (optional but recommended)
+table_pa_clean <- table_pa_clean[, colSums(table_pa_clean) > 0]
+
+# Convert to a matrix to strip any problematic attributes
+table_pa_matrix <- as.matrix(table_pa_clean)
+
+# Remove any lingering attributes
+attributes(table_pa_matrix) <- list(
+  dim = dim(table_pa_matrix),
+  dimnames = dimnames(table_pa_matrix)
+)
+
+# Get the number of sites (samples)
+n_sites <- ncol(table_pa_clean)
+
+# Calculate incidence frequencies (number of sites where each species occurs)
+incidence_freq <- rowSums(table_pa)
+
+# Remove species with zero incidence (not detected anywhere)
+incidence_freq <- incidence_freq[incidence_freq > 0]
+
+# Create the correct data structure for iNEXT
+# First element = number of sites, then all incidence frequencies
+inext_data <- c(n_sites, incidence_freq)
+
+# Now run iNEXT with datatype = "incidence_freq"
+out <- iNEXT::iNEXT(
+  x = inext_data,
+  datatype = "incidence_freq",
+  q = 0)
+
+# Check results
+ggiNEXT(out, type = 3) + My_Theme
+
+# Your data has one assemblage, so the coverage is just the single value
+coverage_info <- DataInfo(table_pa_clean, datatype = "incidence_raw")
+target_coverage <- coverage_info$SC 
+print(paste("Target coverage:", target_coverage))
+```
+
+
+### By treatment
+
+#### ASV level
+
+```{r}
+# Get treatment information
+metadata_subset <- metadata[metadata$Sample_ID %in% colnames(table_pa_clean), ]
+metadata_subset <- metadata_subset[match(colnames(table_pa_clean), metadata_subset$Sample_ID), ]
+
+# Get treatments in alphabetical order (same as ggiNEXT)
+treatments_sorted <- sort(treatments)
+
+# Name the colors with the alphabetical treatment names
+names(cols.method) <- treatments_sorted
+
+# Prepare data for each treatment as a list
+treatment_data <- list()
+
+for (treatment in treatments) {
+  # Get sample IDs for this treatment
+  sample_ids <- metadata_subset$Sample_ID[metadata_subset$TREATMENT == treatment]
+  sample_ids <- sample_ids[sample_ids %in% colnames(table_pa_clean)]
+  
+  if (length(sample_ids) < 2) {
+    warning(paste("Treatment", treatment, "has too few samples, skipping"))
+    next
+  }
+  
+  # Subset the incidence matrix for this treatment
+  table_pa_treatment <- table_pa_clean[, sample_ids, drop = FALSE]
+  table_pa_treatment <- table_pa_treatment[rowSums(table_pa_treatment) > 0, , drop = FALSE]
+  table_pa_treatment <- table_pa_treatment[, colSums(table_pa_treatment) > 0, drop = FALSE]
+  
+  if (ncol(table_pa_treatment) < 2 || nrow(table_pa_treatment) < 2) {
+    warning(paste("Treatment", treatment, "has too few sites or species, skipping"))
+    next
+  }
+  
+  # Convert to matrix
+  table_pa_matrix <- as.matrix(table_pa_treatment)
+  
+  # Calculate incidence frequencies
+  incidence_freq <- rowSums(table_pa_matrix)
+  n_sites <- ncol(table_pa_matrix)
+  
+  # Create iNEXT data structure - first value is number of sites
+  treatment_data[[treatment]] <- c(n_sites, incidence_freq)
+}
+
+# Run iNEXT on all treatments simultaneously
+if (length(treatment_data) > 0) {
+  out_combined <- iNEXT::iNEXT(
+    x = treatment_data,
+    datatype = "incidence_freq",
+    q = 0,
+    se = TRUE)
+  
+  # Get treatment names in the order they appear in the plot (alphabetical)
+  treatment_names_in_plot <- sort(names(treatment_data))
+  
+  # Subset colors to only include treatments that exist
+  cols_method_subset <- cols.method[names(cols.method) %in% treatment_names_in_plot]
+  
+  # Reorder colors to match the alphabetical order
+  cols_method_ordered <- cols_method_subset[treatment_names_in_plot]
+  
+  # Print color assignment to verify
+  print("Color assignment:")
+  print(cols_method_ordered)
+  
+  # Plot 1: Sample-size-based R/E curves
+  p1 <- ggiNEXT(out_combined, type = 1, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample effort", 
+         y = "ASV richness (q = 0)") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered) +ylim(0,250)
+  
+  # Plot 2: Sample completeness curves
+  p2 <- ggiNEXT(out_combined, type = 2, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample effort", 
+         y = "Sample coverage") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered)
+  
+  # Plot 3: Coverage-based R/E curves
+  p3 <- ggiNEXT(out_combined, type = 3, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample coverage", 
+         y = "ASV richness (q = 0)") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered) + xlim(0,1)
+  
+  # Print plots
+  print(p1)
+  print(p2)
+  print(p3)
+ } else {
+  print("No treatments were successfully processed.")
+}
+
+```
+
+#### Genus level
+
+```{r}
+# Extract the Genus column from final_pa
+# Identify the Genus column (adjust column name if needed)
+genus_col <- grep("Genus|genus|g__", colnames(final_pa), value = TRUE)
+if (length(genus_col) == 0) {
+  stop("No Genus column found in final_pa. Please check column names.")
+}
+print(paste("Using genus column:", genus_col))
+
+# Extract genera as character vector
+genera <- as.character(final_pa[[genus_col]])
+
+# Handle NA or empty values
+genera[is.na(genera) | genera == ""] <- "Unclassified"
+
+# Check length matches
+if (length(genera) != nrow(table_pa)) {
+  stop("Length of genera does not match number of rows in table_pa")
+}
+
+# Convert table_pa to matrix
+table_pa_matrix <- as.matrix(table_pa)
+
+# Aggregate by genus using rowsum (sum across ASVs)
+genus_aggregated <- rowsum(table_pa_matrix, group = genera)
+
+# Convert to presence/absence (1 if genus detected in sample)
+genus_matrix <- genus_aggregated
+genus_matrix[genus_matrix > 0] <- 1
+
+# Remove genera with no occurrences across all samples
+genus_matrix <- genus_matrix[rowSums(genus_matrix) > 0, ]
+
+# Store as table_pa_genus
+table_pa_genus <- genus_matrix
+
+# Print summary
+print(paste("ASV-level: 213 ASVs × 105 samples"))
+print(paste("Genus-level:", nrow(table_pa_genus), "genera ×", ncol(table_pa_genus), "samples"))
+
+
+# 2. PREPARE METADATA FOR GENUS-LEVEL DATA
+# ----------------------------------------------------------------------------
+# Get treatment information
+metadata_subset <- metadata[metadata$Sample_ID %in% colnames(table_pa_genus), ]
+metadata_subset <- metadata_subset[match(colnames(table_pa_genus), metadata_subset$Sample_ID), ]
+
+# Get treatments
+treatments <- unique(metadata_subset$TREATMENT)
+treatments_sorted <- sort(treatments)
+
+names(cols.method) <- treatments_sorted
+
+
+# 3. PREPARE iNEXT DATA FOR EACH TREATMENT
+# ----------------------------------------------------------------------------
+treatment_data_genus <- list()
+
+for (treatment in treatments) {
+  # Get sample IDs for this treatment
+  sample_ids <- metadata_subset$Sample_ID[metadata_subset$TREATMENT == treatment]
+  sample_ids <- sample_ids[sample_ids %in% colnames(table_pa_genus)]
+  
+  if (length(sample_ids) < 2) {
+    warning(paste("Treatment", treatment, "has too few samples, skipping"))
+    next
+  }
+  
+  # Subset the incidence matrix for this treatment
+  table_pa_treatment <- table_pa_genus[, sample_ids, drop = FALSE]
+  table_pa_treatment <- table_pa_treatment[rowSums(table_pa_treatment) > 0, , drop = FALSE]
+  table_pa_treatment <- table_pa_treatment[, colSums(table_pa_treatment) > 0, drop = FALSE]
+  
+  if (ncol(table_pa_treatment) < 2 || nrow(table_pa_treatment) < 2) {
+    warning(paste("Treatment", treatment, "has too few sites or species, skipping"))
+    next
+  }
+  
+  # Convert to matrix
+  table_pa_matrix <- as.matrix(table_pa_treatment)
+  
+  # Calculate incidence frequencies
+  incidence_freq <- rowSums(table_pa_matrix)
+  n_sites <- ncol(table_pa_matrix)
+  
+  # Create iNEXT data structure - first value is number of sites
+  treatment_data_genus[[treatment]] <- c(n_sites, incidence_freq)
+}
+
+# Print summary
+print(paste("Number of treatments with data:", length(treatment_data_genus)))
+print(names(treatment_data_genus))
+
+
+# 4. RUN iNEXT ON GENUS-LEVEL DATA
+# ----------------------------------------------------------------------------
+if (length(treatment_data_genus) > 0) {
+  out_combined_genus <- iNEXT::iNEXT(
+    x = treatment_data_genus,
+    datatype = "incidence_freq",
+    q = 0,
+    se = TRUE,
+    nboot = 50
+  )
+  
+  # Get treatment names in alphabetical order
+  treatment_names_in_plot <- sort(names(treatment_data_genus))
+  
+  # Subset and order colors
+  cols_method_subset <- cols.method[names(cols.method) %in% treatment_names_in_plot]
+  cols_method_ordered <- cols_method_subset[treatment_names_in_plot]
+  
+  print("Color assignment for genus-level plots:")
+  print(cols_method_ordered)
+  
+  
+  # 5. CREATE GENUS-LEVEL PLOTS
+  # --------------------------------------------------------------------------
+  # Plot 1: Sample-size-based R/E curves
+  p1_genus <- ggiNEXT(out_combined_genus, type = 1, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample effort", 
+         y = "Genus richness (q = 0)") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered)
+  
+  # Plot 2: Sample completeness curves
+  p2_genus <- ggiNEXT(out_combined_genus, type = 2, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample effort", 
+         y = "Sample coverage") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered)
+  
+  # Plot 3: Coverage-based R/E curves
+  p3_genus <- ggiNEXT(out_combined_genus, type = 3, color.var = "Assemblage") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sample coverage", 
+         y = "Genus richness (q = 0)") +
+    theme(legend.position = "right",
+          legend.title = element_blank()) +
+    scale_color_manual(values = cols_method_ordered) +
+    scale_fill_manual(values = cols_method_ordered)
+  
+  
+  # 6. DISPLAY PLOTS
+  # -----------------------------------------------------------------------
+  print(p1_genus)
+  print(p2_genus)
+  print(p3_genus)
+  }
+
+```
+
+####Plotted together
+
+```{r}
+coveragerarefaction=ggarrange(p3, p1, p3_genus, p1_genus, nrow=2, ncol=2, labels = "AUTO", common.legend = T, legend = "right")
+coveragerarefaction
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("Rarefaction_", GROUPING,".pdf")),
+  plot    =coveragerarefaction,
+  width   =11,
+  height  =9,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+### Observed vs Estimated
+
+```{r}
+info_data=DataInfo(treatment_data, datatype="incidence_freq") # method coverages
+info_data
+
+coverage_data=estimateD(
+    treatment_data,
+    datatype = "incidence_freq",
+    base = "coverage",
+    level = 0.5,
+    q = 0
+)
+
+coverage_data=merge(coverage_data, info_data, by="Assemblage")
+
+hill_df_cov=coverage_data %>% 
+  dplyr::select(Assemblage, Order.q, qD, qD.UCL, qD.LCL, S.obs, SC.y) %>%
+  tidyr::pivot_wider(
+    names_from=Order.q,
+    values_from=qD,
+    names_prefix="Hill_q"
+  )
+hill_df_cov
+
+
+#hill_df_cov$Assemblage <- factor(hill_df_cov$Assemblage, levels = names(cols.method))
+
+ggplot(hill_df_cov,
+       aes(x = Hill_q0,
+           y = Assemblage)) +
+  geom_errorbarh(
+    aes(xmin = qD.LCL,
+        xmax = qD.UCL,
+        color = Assemblage),
+    height = 0.2,
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(color = Assemblage),
+    size = 3
+  ) +
+  scale_color_manual(values = cols.method) +
+  theme_bw(base_size = 14) +theme(legend.position = "none") +
+  labs(
+    x = "Estimated ASV richness (q = 0)",
+    y = NULL,
+    color = NULL
+  )
+
+plot_df <- hill_df_cov %>%
+  select(Assemblage, S.obs, Hill_q0, qD.LCL, qD.UCL) %>%
+  pivot_longer(
+    cols = c(S.obs, Hill_q0),
+    names_to = "Estimate",
+    values_to = "Richness"
+  ) %>%
+  mutate(
+    Estimate = factor(
+      Estimate,
+      levels = c("S.obs", "Hill_q0"),
+      labels = c("Observed richness", 
+                 "Coverage-standardized richness")
+    )
+  )
+
+plot_df$Assemblage <- factor(
+  plot_df$Assemblage,
+  levels = hill_df_cov$Assemblage[order(hill_df_cov$Hill_q0)]
+)
+
+coveragevsobserved=ggplot(plot_df,
+       aes(x = Richness,
+           y = Assemblage,
+           color = Assemblage,
+           shape = Estimate)) +
+  geom_errorbarh(
+    data = hill_df_cov,
+    aes(
+      y = reorder(Assemblage, Hill_q0),
+      xmin = qD.LCL,
+      xmax = qD.UCL
+    ),
+    height = 0.15,
+    linewidth = 0.5,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    size = 3
+  ) +
+  scale_color_manual(values = cols.method, guide = "none") +
+  scale_shape_manual(
+    values = c(
+      "Observed richness" = 16,
+      "Coverage-standardized richness" = 17
+    )
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "ASV richness (q = 0)",
+    y = NULL,
+    color = NULL,
+    shape = NULL
+  ) + theme(legend.position = "top")
+
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("richness_obs_vs_est_", GROUPING, ".pdf")),
+  plot    =coveragevsobserved,
+  width   =8,
+  height  =5,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
+```
+
+
+## 5. Sampling effort
+
+This code creates two types of accumulation curves: a sequence depth rarefaction curve showing how many distinct organisms (MOTUs) you detect as you sequence more reads per sample, and sample rarefaction curves showing how taxonomic coverage increases as you include more samples. The sample curves are generated both for all data combined and separately for different groups (defined by your GROUPING variable, like sites or treatments), using the iNEXT package to interpolate and extrapolate the curves with confidence intervals.
+
+### Sequence depth rarefaction
+
+```{r}
+rarecurve(table.reads.t, step = 1000, col = rainbow(nrow(table.reads.t)), label = F, xlab = "Sequence Depth",  ylab = "MOTUs")
+```
+
+## 6. Indicator taxa
+This code aggregates OTUs by a higher taxonomic rank (e.g., genus or family), then runs indicator species analysis (IndVal) to identify which taxa are significantly associated with specific groups (e.g., sites or treatments). It filters significant indicators (adjusted p < 0.15), then creates a faceted time-series plot showing how the abundance of each indicator taxon changes over time, with separate panels for each group and each indicator taxon, using violin-boxplots and a dashed line connecting medians.
+
+### Aggregate OTU table
+
+```{r}
+group=as.factor(metatable.reps[[GROUPING]])
+taxonomic.rank=community.data[[TAXONOMICRANK]] 
+
+com=community.table.t
+
+colnames(com)=taxonomic.rank
+
+prefixes = unique(sub("\\..*", "", colnames(com)))
+prefixes = prefixes[prefixes != ""]
+
+com=sapply(prefixes, function(x) rowSums(com[,startsWith(colnames(com), x), drop=F])) ##OTU table with combined taxonomies (no repeated columns)
+
+com=as.data.frame(com)
+
+ncom=ncol(com)
+```
+
+
+## 7. Heatmap
+
+### Pooled
+
+```{r}
+# ============================================
+# HEATMAP - LOG-TRANSFORMED SUMMED READS BY TREATMENT
+# ============================================
+
+library(pheatmap)
+
+# Match samples
+common_samples <- intersect(rownames(com), metadata[[SAMPLE]])
+com_subset <- com[common_samples, ]
+metadata_subset <- metadata[match(common_samples, metadata[[SAMPLE]]), ]
+
+# Sum reads by treatment
+sum_by_treatment <- aggregate(com_subset, 
+                              by = list(Treatment = metadata_subset$TREATMENT), 
+                              FUN = sum)
+
+# Set treatment as rownames and remove the Treatment column
+rownames(sum_by_treatment) <- sum_by_treatment$Treatment
+sum_by_treatment <- sum_by_treatment[, -1]
+
+# Transpose so taxa are rows, treatments are columns
+heatmap_data <- t(sum_by_treatment)
+
+# Log transform (log1p = log(1+x) to handle zeros)
+heatmap_data_log <- log1p(heatmap_data)
+
+
+# Create heatmap (no scaling)
+heatmap=pheatmap(heatmap_data_log,
+         scale = "none", fontsize_row = 8,
+         fontsize_col = 10,
+         angle_col = 45,
+         cellwidth = 30,
+         cellheight = 10,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         cluster_rows = T,
+         cluster_cols = F,
+         color = colorRampPalette(c("white", "tan", "firebrick3"))(100))
+heatmap
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("heatmap_", GROUPING, ".pdf")),
+  plot    =heatmap,
+  width   =6,
+  height  =12,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial")
+```

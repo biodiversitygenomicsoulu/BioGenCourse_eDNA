@@ -1,0 +1,238 @@
+---
+title: "venn"
+author: "Patrick Nichols"
+date: "2025-11-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(zetadiv)
+library(ggpubr)
+library(stringr)
+library(tibble)
+library(grid)
+library(gtools)
+library(eulerr)
+library(VennDiagram)
+
+My_Theme = theme_set(theme_bw()+theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_blank(), 
+  panel.border = element_rect(fill=NA, colour = "black"), 
+  panel.spacing = unit(1, "lines"),
+  axis.title.x = element_text(size = 12, color="black"),
+  axis.text.x = element_text(size = 12, color="black"),
+  axis.title.y = element_text(size = 12, color = "black"),
+  axis.text.y = element_text(size=12, color = "black"),
+  legend.text = element_text(size=12, color = "black"),
+  strip.text.x = element_text(size=10, color="black"),
+  strip.text.y = element_text(size=10, color="black"),
+  strip.text = element_text(size = 10, color = "black"),
+  strip.background = element_blank(), 
+  strip.placement = "outside",
+  title = element_text(size=14, color="black", face="bold"),
+  axis.title = element_text(size=12, face="bold", colour = "black"), 
+  axis.text = element_blank()))
+
+My_Theme = theme_set(theme_bw()+theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_blank(), 
+  panel.border = element_rect(fill=NA, colour = "black"), 
+  panel.spacing = unit(1, "lines"),
+  axis.title.x = element_text(size = 12, color="black"),
+  axis.text.x = element_text(size = 12, color="black"),
+  axis.title.y = element_text(size = 12, color = "black"),
+  axis.text.y = element_text(size=12, color = "black"),
+  legend.text = element_text(size=12, color = "black"),
+  strip.text.x = element_text(size=10, color="black"),
+  strip.text.y = element_text(size=10, color="black"),
+  strip.text = element_text(size = 10, color = "black"),
+  strip.background = element_blank(), 
+  strip.placement = "outside",
+  title = element_text(size=14, color="black", face="bold"),
+  axis.title = element_text(size=12, face="bold", colour = "black"), 
+  axis.text = element_blank()))
+
+cols.region=c("#b45a8e", "#b6ccd7") #keehi, maunalua
+cols.method=c("#4282aa", "#F26419") #active, passive
+cols.marker=c(
+  "#8CB89F",  # Algae23S
+  "#CE6A85",  # Corals16S
+  "#F6AE2D",  # Eukaryotes18S
+  "#844E6B",  # FishMFU
+  "#1E555C",  # InvertsCOI
+  "black"
+)
+
+cols.all=c("#4282aa", #active
+           "#8CB89F", #algae
+           "#CE6A85", #coral
+           "#F6AE2D", #eukary
+           "#844E6B", #fish
+           "#1E555C", #invert
+           "#b45a8e", #keehi
+           "#b6ccd7", #mauna
+           "#F26419") #passive
+
+#### Set Taxonomic Rank to Plot ######################################
+taxonomic.rank <- "Genus" 
+######################################################################
+```
+
+# 1. Load Data
+
+```{r}
+# Read tables
+table.1 <- read.csv(file.choose(), header=T); table.1$Marker <- "MiBird"
+table.2 <- read.csv(file.choose(), header=T); table.2$Marker <- "Teleo2"
+
+# MERGE INPUT DATA
+table.compare <- rbind(table.1, table.2) #table.4
+
+# Get unique taxonomic information from Phylum to Genus
+unique_taxonomy <- table.compare %>%
+  select(Phylum, Class, Order, Family, Genus) %>%
+  distinct() %>%
+  arrange(Phylum, Class, Order, Family, Genus)
+
+
+rank_sym <- sym(taxonomic.rank)
+
+# SQUISH WHITESPACE IN TAXA
+table.compare <- table.compare %>%
+  mutate(
+    !!rank_sym := str_squish(!!rank_sym)
+  )
+
+df_rank <- table.compare %>%
+  filter(
+    !is.na(!!rank_sym),
+    !!rank_sym != "dropped"
+  )
+
+rank_filtration <- df_rank %>%
+  distinct(!!rank_sym, TREATMENT) %>%   # presence only
+  mutate(present = 1) %>%
+  pivot_wider(
+    names_from = TREATMENT,
+    values_from = present,
+    values_fill = 0
+  )
+
+# rename dynamic rank column to "taxon"
+rank_filtration <- rank_filtration %>%
+  rename(taxon = !!rank_sym)
+
+library(ComplexUpset)
+filename <- paste0("3upset_", taxonomic.rank, ".pdf")
+cairo_pdf(filename = filename, width=7, height=4, family="Arial")
+upset(
+  rank_filtration,
+  intersect = c("Coffee-Column", "Coffee-QuickExtract", "Passive-Column", "Passive-QuickExtract", "Sylphium-Sylphium"),  # the FILTRATION columns
+  name = "Filtration Method",
+  width_ratio = 0.2
+)
+dev.off()
+
+rank_filtration$Genus=rank_filtration$taxon
+rank_filtration$taxon=NULL
+rank_filtration=merge(unique_taxonomy, rank_filtration, by="Genus")
+write.csv(rank_filtration, file = "2upsetdata_method.csv", row.names = F)
+```
+
+
+```{r}
+ranks <- c("Phylum", "Class", "Order", "Family", "Genus")
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ComplexUpset)
+library(rlang)
+
+# Suppose table.compare is already loaded (merged from all markers)
+# and FILTRATION column exists (Active / Passive)
+
+# Stack all ranks together
+rank_long <- lapply(ranks, function(rank_name) {
+  
+  rank_sym <- sym(rank_name)
+  
+  table.compare %>%
+    # squish whitespace
+    mutate(!!rank_sym := str_squish(!!rank_sym)) %>%
+    # filter out NA/dropped
+    filter(!is.na(!!rank_sym), !!rank_sym != "dropped") %>%
+    # keep only unique combinations of taxon + FILTRATION
+    distinct(!!rank_sym, TREATMENT) %>%
+    mutate(present = 1) %>%
+    pivot_wider(
+      names_from = TREATMENT,
+      values_from = present,
+      values_fill = 0
+    ) %>%
+    rename(taxon = !!rank_sym) %>%
+    # add rank column
+    mutate(rank = rank_name)
+  
+}) %>% bind_rows()
+# Optional: reorder ranks for plotting
+rank_long$rank <- factor(rank_long$rank, levels = ranks)
+
+cairo_pdf(filename = "3upset_method.pdf", width=7, height=4, family="Arial")
+upset(
+  rank_long,
+  intersect = c("Coffee-Column", "Coffee-QuickExtract", "Passive-Column", "Passive-QuickExtract", "Sylphium-Sylphium"),  # the FILTRATION columns
+  name = "Filtration Method",
+  width_ratio = 0.2,
+  base_annotations = list(
+    'Intersection size' = intersection_size(
+      mapping = aes(fill = rank)  # just map fill, don't specify geom
+    )
+  )
+) 
+dev.off()
+```
+
+
+```{r}
+
+# Unique to Active
+active <- rank_long %>%
+  filter(Active == 1 & Passive == 0) %>%
+  arrange(rank, taxon)
+
+# Unique to Passive
+passive <- rank_long %>%
+  filter(Passive == 1 & Active == 0) %>%
+  arrange(rank, taxon)
+
+# Active
+unique.active=active %>%
+  group_by(rank) %>%
+  summarise(taxa = paste(taxon, collapse = ", ")) %>%
+  mutate(method="Active")
+
+unique.active.sum=active %>%
+  group_by(rank) %>%
+  summarise(n_unique = n())
+
+# Passive
+unique.passive=passive %>%
+  group_by(rank) %>%
+  summarise(taxa = paste(taxon, collapse = ", ")) %>%
+  mutate(method="Passive")
+
+unique.passive.sum=passive %>%
+  group_by(rank) %>%
+  summarise(n_unique = n())
+
+unique.taxa.method=rbind(unique.active, unique.passive)
+write.csv(unique.taxa.method, file="2unique_method_ranks.csv", row.names = F)
+```
+
