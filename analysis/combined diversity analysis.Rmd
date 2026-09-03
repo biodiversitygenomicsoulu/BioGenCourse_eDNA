@@ -219,9 +219,9 @@ table_index.t=t(table_index)
 
 ```{r}
 ####CHOOSE MATRIX###################################################
-community.table.t=table_index.t #transposed otu table version (OPTIONS: table_index.t, table_hel.t, table.reads.t, table_pa.t)
-community.table=table_index #otu table only (OPTIONS: table_index, table_hel, table.reads, table_pa, etc.)
-community.data=final_index #version with metadata (OPTIONS: final_index, final_hel, final_reads, final_pa, etc.)
+community.table.t=table.reads.t #transposed otu table version (OPTIONS: table_index.t, table_hel.t, table.reads.t, table_pa.t)
+community.table=table.reads #otu table only (OPTIONS: table_index, table_hel, table.reads, table_pa, etc.)
+community.data=final_reads #version with metadata (OPTIONS: final_index, final_hel, final_reads, final_pa, etc.)
 ###################################################################
 ```
 
@@ -482,6 +482,32 @@ letters_df_multcomp <- data.frame(
   letters = cld_result$mcletters$Letters
 )
 print(letters_df_multcomp)
+
+
+# Get pairwise comparisons
+tukey_result <- glht(nb_model, linfct = mcp(TREATMENT = "Tukey"))
+
+# Get summary as a data frame
+tukey_summary <- summary(tukey_result)
+tukey_table <- data.frame(
+  Comparison = names(tukey_summary$test$coefficients),
+  Z = tukey_summary$test$coefficients,
+  P.unadj = tukey_summary$test$pvalues
+)
+
+# Adjust p-values (if you want Bonferroni, like in your example)
+tukey_table$P.adj <- p.adjust(tukey_table$P.unadj, method = "bonferroni")
+
+# Reorder to match alphabetical comparison format
+print(tukey_table)
+
+# Get compact letter display
+cld_result <- cld(tukey_result, level = 0.05)
+letters_df <- data.frame(
+  TREATMENT = names(cld_result$mcletters$Letters),
+  letters = cld_result$mcletters$Letters
+)
+print(letters_df)
 ```
 
 
@@ -498,7 +524,7 @@ sample_cols <- names(removed.reads.data)[17:ncol(removed.reads.data)]
 # Reshape to long format
 removed_long <- removed.reads.data %>%
   # Keep OTU_ID and taxonomic info for reference (optional)
-  select(OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species, all_of(sample_cols)) %>%
+  dplyr::select(OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species, all_of(sample_cols)) %>%
   # Pivot to long format
   pivot_longer(
     cols = all_of(sample_cols),
@@ -510,7 +536,7 @@ removed_long <- removed.reads.data %>%
 
 # Extract sample-treatment mapping from your existing data_long
 sample_treatment_map <- data_long %>%
-  select(Sample_ID, TREATMENT,SITE) %>%
+  dplyr::select(Sample_ID, TREATMENT,SITE) %>%
   distinct()
 
 # Join with removed_long
@@ -565,7 +591,7 @@ asv_richness %>%
 ```{r}
 # 1. Calculate total contaminant reads per sample
 contaminant_reads <- removed_long %>%
-  group_by(Sample_ID, TREATMENT) %>%
+  dplyr::group_by(Sample_ID, TREATMENT) %>%
   summarise(
     total_contaminant_reads = sum(count, na.rm = TRUE),
     n_contaminant_ASVs = n_distinct(OTU_ID),
