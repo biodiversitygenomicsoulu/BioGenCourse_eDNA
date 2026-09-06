@@ -584,6 +584,13 @@ asv_richness %>%
     min_ASVs = min(n_ASVs),
     max_ASVs = max(n_ASVs)
   )
+
+contam.seqs=reads.removed[,1:2]
+
+removed_long_OTUs=removed_long %>% group_by(OTU_ID, Phylum, Class, Order, Family, Genus, Species, TREATMENT) %>% summarise(total=sum(count))
+removed_long_OTUs=merge(removed_long_OTUs, contam.seqs, by="OTU_ID")
+
+write.csv(removed_long_OTUs, file = file.path(paths$data_processed, "contaminated_reads.csv"), row.names = F)
 ```
 
 #### Reads
