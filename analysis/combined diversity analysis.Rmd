@@ -584,14 +584,106 @@ asv_richness %>%
     min_ASVs = min(n_ASVs),
     max_ASVs = max(n_ASVs)
   )
+```
 
+#### Contamination reporting 
+
+```{r}
 contam.seqs=reads.removed[,1:2]
 
 removed_long_OTUs=removed_long %>% group_by(OTU_ID, Phylum, Class, Order, Family, Genus, Species, TREATMENT) %>% summarise(total=sum(count))
 removed_long_OTUs=merge(removed_long_OTUs, contam.seqs, by="OTU_ID")
 
 write.csv(removed_long_OTUs, file = file.path(paths$data_processed, "contaminated_reads.csv"), row.names = F)
+
+contam_bubble <- removed_long_OTUs %>%
+  #filter(Family != "NoMatch") %>%
+  group_by(TREATMENT, Family) %>%
+  summarise(total_reads = sum(total), .groups = 'drop') %>%
+  group_by(TREATMENT) %>%
+  mutate(rel_abund = total_reads / sum(total_reads) * 100) %>%
+  ungroup() %>%
+  # Keep top families
+  group_by(Family) %>%
+  mutate(total_all = sum(total_reads)) %>%
+  ungroup() %>%
+  filter(total_all >= 50) %>%
+  mutate(Family = factor(Family, levels = unique(Family[order(total_all, decreasing = TRUE)])))
+
+ggplot(contam_bubble, aes(x = TREATMENT, y = Family)) +
+  geom_point(aes(size = total_reads, fill = rel_abund), shape = 21, color = "black") +
+  scale_size_continuous(
+    name = "Total reads",
+    range = c(2, 15),
+    breaks = c(50, 100, 500, 1000, 5000),
+    trans = "sqrt"
+  ) +
+  scale_fill_gradient2(
+    low = "white",
+    mid = "#1a659e",
+    high = "#031d44",
+    midpoint = 10,
+    name = "Relative\nabundance (%)",
+    trans = "log1p"
+  ) +
+  labs(
+    x = "",
+    y = "Family",
+    title = "Contaminant Reads by Treatment and Family"
+  ) +
+  My_Theme +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right"
+  )
+
+
+###Faceted
+# Get top families per treatment
+library(tidytext)  # Need this package
+
+top_per_treatment <- removed_long_OTUs %>%
+  mutate(Family = ifelse(Family == "NoMatch", "Unknown", Family)) %>%
+  group_by(TREATMENT, Family) %>%
+  summarise(total_reads = sum(total), .groups = 'drop') %>%
+  group_by(TREATMENT) %>%
+  mutate(rank = rank(-total_reads, ties.method = "first")) %>%
+  filter(rank <= 100) %>%
+  ungroup()
+
+# Create faceted bar plot with reorder_within
+contaminated_taxaplot=ggplot(top_per_treatment, aes(x = reorder_within(Family, total_reads, TREATMENT), 
+                              y = total_reads, fill = TREATMENT)) +
+  geom_col() +
+  facet_wrap(~TREATMENT, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +  # This is important for proper labeling
+  scale_fill_manual(values = cols.method) +
+  labs(
+    x = "Family",
+    y = "log10(Contaminated Reads)"
+  ) +
+  My_Theme +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 8),
+    axis.text.y = element_text(size = 6)
+  ) + 
+  scale_y_log10()
+
+contaminated_taxaplot
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("contamination_family.pdf")), plot    =contaminated_taxaplot,
+  width   =7,
+  height  =4,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial"
+)
 ```
+
 
 #### Reads
 
