@@ -586,105 +586,6 @@ asv_richness %>%
   )
 ```
 
-#### Contamination reporting 
-
-```{r}
-contam.seqs=reads.removed[,1:2]
-
-removed_long_OTUs=removed_long %>% group_by(OTU_ID, Phylum, Class, Order, Family, Genus, Species, TREATMENT) %>% summarise(total=sum(count))
-removed_long_OTUs=merge(removed_long_OTUs, contam.seqs, by="OTU_ID")
-
-write.csv(removed_long_OTUs, file = file.path(paths$data_processed, "contaminated_reads.csv"), row.names = F)
-
-contam_bubble <- removed_long_OTUs %>%
-  #filter(Family != "NoMatch") %>%
-  group_by(TREATMENT, Family) %>%
-  summarise(total_reads = sum(total), .groups = 'drop') %>%
-  group_by(TREATMENT) %>%
-  mutate(rel_abund = total_reads / sum(total_reads) * 100) %>%
-  ungroup() %>%
-  # Keep top families
-  group_by(Family) %>%
-  mutate(total_all = sum(total_reads)) %>%
-  ungroup() %>%
-  filter(total_all >= 50) %>%
-  mutate(Family = factor(Family, levels = unique(Family[order(total_all, decreasing = TRUE)])))
-
-ggplot(contam_bubble, aes(x = TREATMENT, y = Family)) +
-  geom_point(aes(size = total_reads, fill = rel_abund), shape = 21, color = "black") +
-  scale_size_continuous(
-    name = "Total reads",
-    range = c(2, 15),
-    breaks = c(50, 100, 500, 1000, 5000),
-    trans = "sqrt"
-  ) +
-  scale_fill_gradient2(
-    low = "white",
-    mid = "#1a659e",
-    high = "#031d44",
-    midpoint = 10,
-    name = "Relative\nabundance (%)",
-    trans = "log1p"
-  ) +
-  labs(
-    x = "",
-    y = "Family",
-    title = "Contaminant Reads by Treatment and Family"
-  ) +
-  My_Theme +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-    axis.text.y = element_text(size = 10),
-    legend.position = "right"
-  )
-
-
-###Faceted
-# Get top families per treatment
-library(tidytext)  # Need this package
-
-top_per_treatment <- removed_long_OTUs %>%
-  mutate(Family = ifelse(Family == "NoMatch", "Unknown", Family)) %>%
-  group_by(TREATMENT, Family) %>%
-  summarise(total_reads = sum(total), .groups = 'drop') %>%
-  group_by(TREATMENT) %>%
-  mutate(rank = rank(-total_reads, ties.method = "first")) %>%
-  filter(rank <= 100) %>%
-  ungroup()
-
-# Create faceted bar plot with reorder_within
-contaminated_taxaplot=ggplot(top_per_treatment, aes(x = reorder_within(Family, total_reads, TREATMENT), 
-                              y = total_reads, fill = TREATMENT)) +
-  geom_col() +
-  facet_wrap(~TREATMENT, scales = "free_y") +
-  coord_flip() +
-  scale_x_reordered() +  # This is important for proper labeling
-  scale_fill_manual(values = cols.method) +
-  labs(
-    x = "Family",
-    y = "log10(Contaminated Reads)"
-  ) +
-  My_Theme +
-  theme(
-    legend.position = "none",
-    strip.text = element_text(face = "bold", size = 8),
-    axis.text.y = element_text(size = 6)
-  ) + 
-  scale_y_log10()
-
-contaminated_taxaplot
-
-ggsave(
-  filename=file.path(paths$results_figs,paste0("contamination_family.pdf")), plot    =contaminated_taxaplot,
-  width   =7,
-  height  =4,
-  units   ="in",
-  device  =cairo_pdf,
-  family  ="Arial"
-)
-```
-
-
 #### Reads
 
 ```{r}
@@ -1391,3 +1292,124 @@ ggsave(
   device  =cairo_pdf,
   family  ="Arial")
 ```
+
+### By Sample
+
+```{r}
+# ============================================
+# HEATMAP - LOG-TRANSFORMED READS BY SITE
+# WITH TREATMENT GROUP COLORING
+# ============================================
+
+library(pheatmap)
+
+# Match samples
+common_samples <- intersect(rownames(com), metadata[[SAMPLE]])
+com_subset <- com[common_samples, ]
+metadata_subset <- metadata[match(common_samples, metadata[[SAMPLE]]), ]
+
+# Check for duplicate SITEs with different treatments
+# This will help us debug
+field_treatment_check <- unique(metadata_subset[, c("SITE", "TREATMENT")])
+if(any(duplicated(field_treatment_check$SITE))) {
+  print("Warning: Some SITEs have multiple TREATMENTS!")
+  print(field_treatment_check[duplicated(field_treatment_check$SITE) | 
+                               duplicated(field_treatment_check$SITE, fromLast = TRUE), ])
+}
+
+# Add SITE and TREATMENT to com_subset
+com_subset$SITE <- metadata_subset$SITE
+com_subset$TREATMENT <- metadata_subset$TREATMENT
+
+# Get taxa columns (all columns except SITE and TREATMENT)
+taxa_columns <- names(com_subset)[!names(com_subset) %in% c("SITE", "TREATMENT")]
+
+# Aggregate by SITE only (not by TREATMENT)
+# First, get unique SITE to treatment mapping
+field_treatment_map <- unique(metadata_subset[, c("SITE", "TREATMENT")])
+names(field_treatment_map)[2] <- "TREATMENT"
+
+# Aggregate reads by SITE (sum across barcodes)
+com_aggregated <- aggregate(com_subset[, taxa_columns], 
+                            by = list(SITE = com_subset$SITE), 
+                            FUN = sum)
+
+# Now add TREATMENT back based on the mapping
+com_aggregated$TREATMENT <- field_treatment_map$TREATMENT[match(com_aggregated$SITE, 
+                                                                 field_treatment_map$SITE)]
+
+# Set SITE as rownames (now they should be unique)
+rownames(com_aggregated) <- com_aggregated$SITE
+
+# Remove SITE and TREATMENT columns for the matrix
+com_field_matrix <- com_aggregated[, !names(com_aggregated) %in% c("SITE", "TREATMENT")]
+
+# Transpose so taxa are rows, SITE are columns
+heatmap_data <- t(com_field_matrix)
+
+# Log transform (log1p = log(1+x) to handle zeros)
+heatmap_data_log <- log1p(heatmap_data)
+
+# Create annotation for columns based on TREATMENT
+annotation_col <- data.frame(
+  Treatment = com_aggregated$TREATMENT
+)
+rownames(annotation_col) <- com_aggregated$SITE
+
+# Define colors for treatments
+unique_treatments <- unique(com_aggregated$TREATMENT)
+treatment_colors <- cols.method
+names(treatment_colors) <- unique_treatments
+
+# Optional: Specify custom colors
+# treatment_colors <- c(
+#   "Passive-Column" = "#1f78b4",
+#   "Passive-QuickExtract" = "#a6cee3",
+#   "Coffee-Column" = "#33a02c",
+#   "Coffee-QuickExtract" = "#b2df8a",
+#   "Sylphium" = "#e31a1c"
+# )
+
+annotation_colors <- list(
+  Treatment = treatment_colors
+)
+
+# Order by treatment for better visualization
+order_idx <- order(com_aggregated$TREATMENT)
+heatmap_data_ordered <- heatmap_data_log[, order_idx]
+annotation_col_ordered <- annotation_col[order_idx, , drop = FALSE]
+
+# Calculate gaps between treatment groups
+treatment_counts <- table(com_aggregated$TREATMENT[order_idx])
+gaps_col <- cumsum(treatment_counts)[-length(treatment_counts)]
+
+# Create heatmap with SITE as sample labels
+sampleheatmap=pheatmap(heatmap_data_ordered,
+         scale = "none", 
+         fontsize_row = 8,
+         fontsize_col = 10,
+         angle_col = 45,
+         cellwidth = 25,
+         cellheight = 10,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         gaps_col = gaps_col,
+         color = colorRampPalette(c("white", "tan", "firebrick3"))(100),
+         annotation_col = annotation_col_ordered,
+         annotation_colors = annotation_colors,
+         annotation_legend = TRUE,
+         main = "Heatmap of OTU abundances by SITE")
+
+
+ggsave(
+  filename=file.path(paths$results_figs,paste0("heatmap_", GROUPING, ".pdf")),
+  plot    =sampleheatmap,
+  width   =25,
+  height  =12,
+  units   ="in",
+  device  =cairo_pdf,
+  family  ="Arial")
+```
+

@@ -89,8 +89,8 @@ taxonomic.rank <- "Genus"
 
 ```{r}
 # Read tables
-table.1 <- read.csv(file.choose(), header=T); table.1$Marker <- "MiBird"
-table.2 <- read.csv(file.choose(), header=T); table.2$Marker <- "Teleo2"
+table.1 <- read.csv(file.choose(), header=T); table.1$Marker <- "MiBird data.long"
+table.2 <- read.csv(file.choose(), header=T); table.2$Marker <- "Teleo2 data.long"
 
 # MERGE INPUT DATA
 table.compare <- rbind(table.1, table.2) #table.4
@@ -131,19 +131,19 @@ rank_filtration <- rank_filtration %>%
 
 library(ComplexUpset)
 filename <- paste0("3upset_", taxonomic.rank, ".pdf")
-cairo_pdf(filename = filename, width=7, height=4, family="Arial")
+#cairo_pdf(filename = filename, width=7, height=4, family="Arial")
 upset(
   rank_filtration,
   intersect = c("Coffee-Column", "Coffee-QuickExtract", "Passive-Column", "Passive-QuickExtract", "Sylphium-Sylphium"),  # the FILTRATION columns
   name = "Filtration Method",
   width_ratio = 0.2
 )
-dev.off()
+#dev.off()
 
 rank_filtration$Genus=rank_filtration$taxon
 rank_filtration$taxon=NULL
 rank_filtration=merge(unique_taxonomy, rank_filtration, by="Genus")
-write.csv(rank_filtration, file = "2upsetdata_method.csv", row.names = F)
+#write.csv(rank_filtration, file = "2upsetdata_method.csv", row.names = F)
 ```
 
 
@@ -184,7 +184,7 @@ rank_long <- lapply(ranks, function(rank_name) {
 # Optional: reorder ranks for plotting
 rank_long$rank <- factor(rank_long$rank, levels = ranks)
 
-cairo_pdf(filename = "3upset_method.pdf", width=7, height=4, family="Arial")
+#cairo_pdf(filename = "3upset_method.pdf", width=7, height=4, family="Arial")
 upset(
   rank_long,
   intersect = c("Coffee-Column", "Coffee-QuickExtract", "Passive-Column", "Passive-QuickExtract", "Sylphium-Sylphium"),  # the FILTRATION columns
@@ -196,43 +196,5 @@ upset(
     )
   )
 ) 
-dev.off()
+#dev.off()
 ```
-
-
-```{r}
-
-# Unique to Active
-active <- rank_long %>%
-  filter(Active == 1 & Passive == 0) %>%
-  arrange(rank, taxon)
-
-# Unique to Passive
-passive <- rank_long %>%
-  filter(Passive == 1 & Active == 0) %>%
-  arrange(rank, taxon)
-
-# Active
-unique.active=active %>%
-  group_by(rank) %>%
-  summarise(taxa = paste(taxon, collapse = ", ")) %>%
-  mutate(method="Active")
-
-unique.active.sum=active %>%
-  group_by(rank) %>%
-  summarise(n_unique = n())
-
-# Passive
-unique.passive=passive %>%
-  group_by(rank) %>%
-  summarise(taxa = paste(taxon, collapse = ", ")) %>%
-  mutate(method="Passive")
-
-unique.passive.sum=passive %>%
-  group_by(rank) %>%
-  summarise(n_unique = n())
-
-unique.taxa.method=rbind(unique.active, unique.passive)
-write.csv(unique.taxa.method, file="2unique_method_ranks.csv", row.names = F)
-```
-
