@@ -1,4 +1,7 @@
 # BioGenCourse_eDNA
+
+## Analysis 
+
 eDNA sequence data and analyses comparing filtration methods and extraction protocols for biomonitoring of vertebrate taxa
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23240918.svg)](https://doi.org/10.5281/zenodo.23240918)
@@ -25,6 +28,15 @@ Raw sequences are deposited in the National Center for Biotechnology Information
 | 2 | teleo diversity analysis.Rmd | imports Tele02 otu table, filters samples, decontaminates with microDecon, runs community analysis |
 | 3 | combined diversity analysis.Rmd | produces main text figures with combined results from both MiBird and Tele02 datasets | 
 | 4 | upset_method.Rmd | runs UpSet analysis and produces method-specific UpSet plot  | 
+
+
+## RShiny Applications
+
+[Teaching Apps](RShinyTeachingApps.md)
+
+## Protocols
+
+[Teaching Protocols](Protocols_Appendix1.md)
 
 ## Citation
 Please cite the associated manuscript when using these data.
