@@ -1,6 +1,7 @@
 # BioGenCourse_eDNA
 eDNA sequence data and analyses comparing filtration methods and extraction protocols for biomonitoring of vertebrate taxa
-[![DOI](https://zenodo.org/badge/1278931184.svg)](https://doi.org/10.5281/zenodo.23240917)
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23240918.svg)](https://doi.org/10.5281/zenodo.23240918)
 
 Raw sequences are deposited in the National Center for Biotechnology Information’s Sequence Read Archive (BioProject: PRJNA1541148). 
 
